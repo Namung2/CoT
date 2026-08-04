@@ -1,7 +1,7 @@
 """BabyAI -> CoT JSONL 생성.
 
-    python datagen.py configs/bosslevel.yaml
-    python datagen.py configs/bosslevel.yaml --n 500 --seed 99 --out data/val
+    python datagen/gen.py configs/bosslevel.yaml
+    python datagen/gen.py configs/bosslevel.yaml --n 500 --seed 99 --out data/val
 
 레벨을 섞지 않는다. 레벨마다 미션 구조가 달라 전이 통계가 다르므로
 섞으면 P(s_t | s_{t-1}) 가 서로 다른 구조의 평균이 되어 뭉개진다.
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 import gymnasium as gym
-import minigrid
+import minigrid  # noqa: F401  환경 등록용
 import numpy as np
 import yaml
 from minigrid.core.constants import IDX_TO_COLOR, IDX_TO_OBJECT
@@ -47,12 +47,18 @@ SEED_SPACE = 2**31 - 1
 
 # 고정값. config 로 뺄 만큼 조정할 일이 없다.
 MAX_STEPS = 128
-MIN_STEPS = 3                # 레벨 median 이 29~67 이라 거의 걸리지 않는다.
+MIN_STEPS = 3
 
-# 아래 레벨은 subgoal 전환이 에피소드당 0~1 회라 transition matrix 가 1x1 이 된다.
-# config 에 넣지 말 것. (사용 가능한 레벨은 configs/*.yaml 참고)
-EASY_LEVELS = ["BabyAI-GoToRedBallGrey-v0", "BabyAI-GoToLocal-v0",
-               "BabyAI-PickupLoc-v0"]
+# 사용 레벨은 configs/*.yaml 참고. 아래는 검토 후 제외한 것들.
+#   GoToRedBallGrey / GoToLocal / PickupLoc : subgoal 전환 0~1 회. transition 없음.
+#   UnblockPickup : instr_kinds=["action"] 이라 미션이 항상 단일 PickupInstr.
+#                   instruction 전환 0.00 회. 긴 시간축 구조가 없다.
+#   SynthSeq      : BossLevel 과 implicit_unlock 하나만 다르다. 실측 통계도
+#                   거의 동일 (steps median 42.5 동일, GoNextTo 91.8% 동일).
+EXCLUDED_LEVELS = [
+    "BabyAI-GoToRedBallGrey-v0", "BabyAI-GoToLocal-v0", "BabyAI-PickupLoc-v0",
+    "BabyAI-UnblockPickup-v0", "BabyAI-SynthSeq-v0",
+]
 
 # 모든 레코드에서 동일하므로 데이터에 저장하지 않는다.
 # 프롬프트 구성은 소비자(latent/) 쪽 결정이다. 필요하면 import 해서 쓴다:
@@ -62,7 +68,7 @@ TASK_PREFIX = (
     "You are an agent in a grid world. You can turn left, turn right, move "
     "forward, pick up an object, drop an object, or interact with what is in "
     "front of you. Your mission: "
-)
+) # 있는데 안씀 -> 철친씨 파트
 
 
 # --------------------------------------------------------------------------
@@ -175,11 +181,36 @@ def instr_done(i) -> int:
 # 자료구조
 # --------------------------------------------------------------------------
 
+def subgoal_info(top) -> tuple[str | None, str | None, str | None]:
+    """bot stack top 에서 (종류, 대상, 이유) 를 읽는다. 부작용 없음.
+
+    GoNextToSubgoal 은 전체의 91% 를 차지하지만 datum/reason 으로 갈린다:
+      datum='blue door', reason='Open'    문을 열러 가는 중
+      datum=(6,9),       reason='Explore' 탐색 중
+      datum='blue key',  reason=None      목표물로 가는 중
+    종류만 쓰면 이 구분이 사라진다.
+    """
+    if top is None:
+        return None, None, None
+    kind = type(top).__name__
+    d = getattr(top, "datum", None)
+    if d is None:
+        target = None
+    elif hasattr(d, "color") or hasattr(d, "type"):        # ObjDesc
+        target = " ".join(str(x) for x in (getattr(d, "color", None),
+                                           getattr(d, "type", None)) if x)
+    else:                                                   # 좌표
+        target = "position"
+    return kind, target or None, getattr(top, "reason", None)
+
+
 @dataclass
 class Step:
     text: str                 # 관측 서술. e_t 를 뽑을 대상.
     action: str
-    subgoal: str | None       # bot stack top
+    subgoal: str | None       # bot stack top 의 종류
+    subgoal_target: str | None
+    subgoal_reason: str | None
     stack_depth: int
     front_obj: str
     front_state: str | None
@@ -199,8 +230,8 @@ class Episode:
     reward: float = 0.0
     final_pos: tuple[int, int] = (0, 0)
     final_dir: int = 0
-    
     # 마지막 행동 이후의 관측. transition 모델 학습에 필요한 흡수 상태.
+    # 상태 T+1 개 / 행동 T 개가 되도록 한다.
     terminal_text: str = ""
     terminal_front_obj: str = ""
     terminal_front_state: str | None = None
@@ -219,7 +250,7 @@ class Episode:
 
 
 # --------------------------------------------------------------------------
-# 성공/실패 rollout method
+# 롤아웃
 # --------------------------------------------------------------------------
 
 def rollout(level: str, seed: int, max_steps: int = MAX_STEPS) -> Episode | None:
@@ -243,10 +274,11 @@ def rollout(level: str, seed: int, max_steps: int = MAX_STEPS) -> Episode | None
                 return None
             act = ACT_NAME[a]
             fobj, _, fstate = front_cell(obs["image"])
+            kind, tgt, rsn = subgoal_info(bot.stack[-1] if bot.stack else None)
             ep.steps.append(Step(
                 text=describe_view(obs["image"], u.carrying),
                 action=act,
-                subgoal=type(bot.stack[-1]).__name__ if bot.stack else None,
+                subgoal=kind, subgoal_target=tgt, subgoal_reason=rsn,
                 stack_depth=len(bot.stack),
                 front_obj=fobj, front_state=fstate,
                 instr_done=instr_done(u.instrs),
@@ -307,6 +339,8 @@ def labels_record(ep: Episode) -> dict:
         "id": ep.id, "level": ep.level, "seed": ep.seed, "n_steps": ep.n,
         "action": [s.action for s in ep.steps],
         "subgoal": [s.subgoal for s in ep.steps],
+        "subgoal_target": [s.subgoal_target for s in ep.steps],
+        "subgoal_reason": [s.subgoal_reason for s in ep.steps],
         "stack_depth": [s.stack_depth for s in ep.steps],
         "front_obj": [s.front_obj for s in ep.steps],
         "front_state": [s.front_state for s in ep.steps],
