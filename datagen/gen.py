@@ -1,15 +1,15 @@
-"""BabyAI -> CoT JSONL 생성.
+"""BabyAI -> CoT JSONL dateset 생성 
 
     python datagen/gen.py configs/bosslevel.yaml
     python datagen/gen.py configs/bosslevel.yaml --n 500 --seed 99 --out data/val
 
-레벨을 섞지 않는다. 레벨마다 미션 구조가 달라 전이 통계가 다르므로
-섞으면 P(s_t | s_{t-1}) 가 서로 다른 구조의 평균이 되어 뭉개진다.
-레벨별로 따로 뽑고, 필요하면 분석 단계에서 합친다.
+레벨을 섞지 않는다. 레벨마다 미션 구조가 달라 step 이 무조건적으로 다르므로,필요시 레벨별로 따로 뽑고, 분석 단계에서 합친다. 현재는 2가지 env(mission + competecies)
+    1. GoToSeq : OPEN(문 열기), UNLOCK(잠금 해제), PICKUP(물건 줍기), PUT(물건 놓기), UNBLOCK(장애물 치우기) competencies들 모두 제외
+       ROOM + DISTR-BOX +  GOTO + SEQ + MAZE => 이동만 수행(장애물,경유 포함)
+    2. BossLevel : 모든 competencies 체크
+모든 competencies 정리는 docs/competencies.md 에 있음(참고)
 
-한 CoT step = primitive action 1개. 정답 궤적은 BabyAI expert bot 이 만든다.
-bot 이 풀면 정답이 구성적으로 보장되므로 rejection sampling 이 아니다.
-
+정답 궤적은 BabyAI expert bot 이 만듦.(신버전 bot minigrid import 포함)
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 import gymnasium as gym
-import minigrid  # noqa: F401  환경 등록용
+import minigrid 
 import numpy as np
 import yaml
 from minigrid.core.constants import IDX_TO_COLOR, IDX_TO_OBJECT
@@ -45,23 +45,21 @@ DOOR_STATE = {0: "open", 1: "closed", 2: "locked"}
 AGENT_I, AGENT_J = 3, 6      # 7x7 egocentric view 에서 agent 위치
 SEED_SPACE = 2**31 - 1
 
-# 고정값. config 로 뺄 만큼 조정할 일이 없다.
-MAX_STEPS = 128
-MIN_STEPS = 3
+MIN_STEPS = 3 # 2 or 3 으로 논의 필요..?
 
 # 사용 레벨은 configs/*.yaml 참고. 아래는 검토 후 제외한 것들.
-#   GoToRedBallGrey / GoToLocal / PickupLoc : subgoal 전환 0~1 회. transition 없음.
+#   GoToRedBallGrey / GoToLocal / PickupLoc : subgoal 전환 0~1 회.
 #   UnblockPickup : instr_kinds=["action"] 이라 미션이 항상 단일 PickupInstr.
 #                   instruction 전환 0.00 회. 긴 시간축 구조가 없다.
-#   SynthSeq      : BossLevel 과 implicit_unlock 하나만 다르다. 실측 통계도
-#                   거의 동일 (steps median 42.5 동일, GoNextTo 91.8% 동일).
+#   SynthSeq      : BossLevel 과 implicit_unlock 하나만 다르다.
+
 EXCLUDED_LEVELS = [
     "BabyAI-GoToRedBallGrey-v0", "BabyAI-GoToLocal-v0", "BabyAI-PickupLoc-v0",
     "BabyAI-UnblockPickup-v0", "BabyAI-SynthSeq-v0",
-]
+] # 비교적 쉬운 MISSION들 -> 요구하는 competencies 가 몇개 없음 일단 사용 X -> 그만큼 같은 subgoal 만 수행
 
 # 모든 레코드에서 동일하므로 데이터에 저장하지 않는다.
-# 프롬프트 구성은 소비자(latent/) 쪽 결정이다. 필요하면 import 해서 쓴다:
+# 프롬프트 구성은 llm loader가 결정. 필요하면 import 해서 쓴다:
 #     from datagen import TASK_PREFIX
 #     prompt = TASK_PREFIX + rec["mission"]
 TASK_PREFIX = (
@@ -253,9 +251,13 @@ class Episode:
 # 롤아웃
 # --------------------------------------------------------------------------
 
-def rollout(level: str, seed: int, max_steps: int = MAX_STEPS) -> Episode | None:
+def rollout(level: str, seed: int) -> Episode | None:
     """bot 으로 1 에피소드. bot 실패 / max_steps 초과 / 미성공이면 None.
     여기서의 None 은 unsolvable 인스턴스 제거에 해당한다.
+
+    max_steps 는 env 자체 예산(레벨별 576~1152, room_size^2 x rows x cols
+    공식)을 그대로 쓴다. 원본 babyai/scripts/make_agent_demos.py 도 별도
+    캡을 두지 않고 이 값에만 의존한다.
 
     (level, seed) 만으로 완전히 결정적이다. 난수를 쓰지 않는다."""
     env = gym.make(level)
@@ -267,7 +269,7 @@ def rollout(level: str, seed: int, max_steps: int = MAX_STEPS) -> Episode | None
         ep.instr_types = [type(x).__name__ for x in instr_leaves(u.instrs)]
         bot = BabyAIBot(env)
 
-        for _ in range(max_steps):
+        for _ in range(u.max_steps):
             try:
                 a = int(bot.replan())
             except Exception:

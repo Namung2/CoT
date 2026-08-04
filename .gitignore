@@ -6,3 +6,5 @@ __pycache__/
 wandb/
 *.tar.gz
 test/
+*.md
+.gitignore
