@@ -96,7 +96,7 @@ def run(level: str | None = None, case: str | None = None):
 
         print(f"saved {out_dir / f'{case_name}.pt'} ({len(bucket['E'])} samples)")
 
-
+    
 if __name__ == "__main__":
     run(level="gotoseq", case="c1")
         
