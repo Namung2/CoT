@@ -1,12 +1,13 @@
-"""조건 c1~c6 후처리.  train.jsonl + labels -> cases/c1..c6.jsonl
+"""조건 c1~c7 후처리.  train.jsonl + labels -> cases/c1..c7.jsonl
 
     python datagen/case.py data/bosslevel
     python datagen/case.py data/bosslevel --cases c1 c2
 
-정보량이 단조 증가하는 여섯 조건으로 step 텍스트를 다시 쓴다.
+정보량이 단조 증가하는 일곱 조건으로 step 텍스트를 다시 쓴다.
 출력 스키마는 train.jsonl 과 동일하므로 소비자(latent/) 는 조건에 무관하게
 같은 로더를 쓴다.
 
+    c7  행동만                              라벨 불필요. 하한(degenerate floor).
     c1  관측만                              라벨 불필요. 본 실험.
     c2  관측 + 행동                         라벨 불필요.
     c3  subgoal 종류 + 행동                 라벨 필요.
@@ -15,6 +16,8 @@
     c6  관측 + subgoal 전체(subgoal + datum + reason) + 행동           라벨 필요. 상한(positive control).
 
 c3~c6 은 state 라벨이 텍스트에 직접 들어간다.
+c7 은 action 종류 수(7가지)만큼만 고유 텍스트가 나오는 degenerate 조건이다.
+c1 이 c7 대비 얼마나 나은지가 "관측이 기여하는 정보량"을 보여준다.
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ CONDITIONS = {
     "c4": "subgoal reason + 행동",
     "c5": "subgoal 종류+reason+대상 + 행동",
     "c6": "관측 + subgoal 전체 + 행동 (상한)",
+    "c7": "행동만 (하한)",
 }
 NEEDS_LABELS = {"c3", "c4", "c5", "c6"}
 
@@ -89,6 +93,8 @@ def build_text(cond: str, obs: str, action: str | None,
         return f"{full_subgoal_phrase(kind, target, reason)} {act}".strip()
     if cond == "c6":
         return f"{obs} {full_subgoal_phrase(kind, target, reason)} {act}".strip()
+    if cond == "c7":
+        return act
     raise ValueError(f"unknown condition: {cond}")
 
 

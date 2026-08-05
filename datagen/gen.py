@@ -66,26 +66,16 @@ TASK_PREFIX = (
     "You are an agent in a grid world. You can turn left, turn right, move "
     "forward, pick up an object, drop an object, or interact with what is in "
     "front of you. Your mission: "
-) # 있는데 안씀 -> 철친씨 파트
+) # 있는데 안씀 -> for 철진
 
 
 # --------------------------------------------------------------------------
 # config
 # --------------------------------------------------------------------------
 
-class Cfg(dict):
-    """cfg.min_steps 처럼 접근 가능한 dict."""
-
-    def __getattr__(self, k):
-        try:
-            return self[k]
-        except KeyError as e:
-            raise AttributeError(k) from e
-
-
-def load_cfg(path: str | Path) -> Cfg:
+def load_cfg(path: str | Path) -> dict:
     with Path(path).open() as f:
-        return Cfg(yaml.safe_load(f))
+        return yaml.safe_load(f)
 
 
 # --------------------------------------------------------------------------
@@ -180,13 +170,11 @@ def instr_done(i) -> int:
 # --------------------------------------------------------------------------
 
 def subgoal_info(top) -> tuple[str | None, str | None, str | None]:
-    """bot stack top 에서 (종류, 대상, 이유) 를 읽는다. 부작용 없음.
-
-    GoNextToSubgoal 은 전체의 91% 를 차지하지만 datum/reason 으로 갈린다:
+    """bot stack top 에서 (종류, 대상, 이유) 를 읽는다.
       datum='blue door', reason='Open'    문을 열러 가는 중
       datum=(6,9),       reason='Explore' 탐색 중
       datum='blue key',  reason=None      목표물로 가는 중
-    종류만 쓰면 이 구분이 사라진다.
+    원본 레포에 있음(세부구현)
     """
     if top is None:
         return None, None, None
@@ -228,7 +216,6 @@ class Episode:
     reward: float = 0.0
     final_pos: tuple[int, int] = (0, 0)
     final_dir: int = 0
-    # 마지막 행동 이후의 관측. transition 모델 학습에 필요한 흡수 상태.
     # 상태 T+1 개 / 행동 T 개가 되도록 한다.
     terminal_text: str = ""
     terminal_front_obj: str = ""
@@ -257,9 +244,9 @@ def rollout(level: str, seed: int) -> Episode | None:
 
     max_steps 는 env 자체 예산(레벨별 576~1152, room_size^2 x rows x cols
     공식)을 그대로 쓴다. 원본 babyai/scripts/make_agent_demos.py 도 별도
-    캡을 두지 않고 이 값에만 의존한다.
+    캡을 두지 않고 이 값에만 의존한다. -> 수정함
 
-    (level, seed) 만으로 완전히 결정적이다. 난수를 쓰지 않는다."""
+    (level, seed) 만으로 완전히 결정적이다. 난수를 쓰지 않는다.-> 고민필요"""
     env = gym.make(level)
     try:
         obs, _ = env.reset(seed=seed)
@@ -336,7 +323,6 @@ def steps_record(ep: Episode) -> dict:
 
 
 def labels_record(ep: Episode) -> dict:
-    """gt 원재료. state 라벨을 여기서 확정하지 않는다."""
     return {
         "id": ep.id, "level": ep.level, "seed": ep.seed, "n_steps": ep.n,
         "action": [s.action for s in ep.steps],
@@ -379,17 +365,10 @@ def seed_stream(master: int) -> Iterator[int]:
             yield s
 
 
-def _git_hash() -> str | None:
-    try:
-        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
-                                       stderr=subprocess.DEVNULL, text=True).strip()
-    except Exception:
-        return None
 
-
-def generate(cfg: Cfg, out_dir: Path | None = None, verbose: bool = True) -> dict:
+def generate(cfg: dict, out_dir: Path | None = None, verbose: bool = True) -> dict:
     """steps / labels / manifest 3 파일을 쓴다. 레벨 하나당 한 디렉토리."""
-    out = Path(out_dir or cfg.out_dir)
+    out = Path(out_dir or cfg["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
     kept = tried = 0
     drop = {"bot_fail": 0, "too_short": 0}
@@ -398,11 +377,11 @@ def generate(cfg: Cfg, out_dir: Path | None = None, verbose: bool = True) -> dic
     fs = (out / "train.jsonl").open("w")
     fl = (out / "train.labels.jsonl").open("w")
     try:
-        for seed in seed_stream(cfg.seed):
-            if kept >= cfg.n:
+        for seed in seed_stream(cfg["seed"]):
+            if kept >= cfg["n"]:
                 break
             last_seed = seed
-            ep = rollout(cfg.level, seed)
+            ep = rollout(cfg["level"], seed)
             tried += 1
             if ep is None:
                 drop["bot_fail"] += 1
@@ -413,7 +392,7 @@ def generate(cfg: Cfg, out_dir: Path | None = None, verbose: bool = True) -> dic
                 fl.write(json.dumps(labels_record(ep), ensure_ascii=False) + "\n")
                 kept += 1
                 if verbose and kept % 200 == 0:
-                    print(f"  {kept}/{cfg.n}  (tried {tried})")
+                    print(f"  {kept}/{cfg['n']}  (tried {tried})")
     finally:
         fs.close()
         fl.close()
@@ -423,7 +402,6 @@ def generate(cfg: Cfg, out_dir: Path | None = None, verbose: bool = True) -> dic
     with (out / "manifest.json").open("w") as f:
         json.dump({
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "git": _git_hash(),
             "python": sys.version.split()[0],
             "minigrid": minigrid.__version__,
             "config": dict(cfg),
