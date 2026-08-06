@@ -27,7 +27,7 @@ def load_samples(data_dir: Path = DATA_DIR, level: str | None = None, case: str 
                 if line:
                     yield path, json.loads(line) # Path(파일경로), line 1개(id, level, seed, mission, steps, terminal ...)
 
-def build_babyai(sample: dict):
+def build_babyai(sample: dict): # 시장에 가면 코드로 변경
     x0 = f"Mission: {sample['mission'].strip()}"
     steps = [s.strip() for s in sample["steps"] if s.strip()]
     if sample.get("terminal"):
@@ -55,7 +55,7 @@ def extract_step_hidden_states(x0: str, steps: list[str]):
     input_ids = torch.tensor([ids], device=model.device) # input tensor
 
     out = model(input_ids, output_hidden_states=True) # forward
-    H = out.hidden_states[-1][0] 
+    H = out.hidden_states[-1][0]
     # [-1]: 마지막 레이어, [0]: 마지막 레이어에서 첫 번째 배치, H = N x d, (N = 전체 토큰수, d = model의 hidden 차원)
     # H는 아직 step 별로 나눠지지 않은 하나의 시퀀스
 
