@@ -238,15 +238,16 @@ class Episode:
 # 롤아웃
 # --------------------------------------------------------------------------
 
-def rollout(level: str, seed: int) -> Episode | None:
+def rollout(level: str, seed: int, max_steps: int | None = None) -> Episode | None:
     """bot 으로 1 에피소드. bot 실패 / max_steps 초과 / 미성공이면 None.
     여기서의 None 은 unsolvable 인스턴스 제거에 해당한다.
 
-    max_steps 는 env 자체 예산(레벨별 576~1152, room_size^2 x rows x cols
-    공식)을 그대로 쓴다. 원본 babyai/scripts/make_agent_demos.py 도 별도
-    캡을 두지 않고 이 값에만 의존한다. -> 수정함
+    max_steps 를 안 주면 env 자체 예산(레벨별 576~1152, room_size^2 x rows x
+    cols 공식)을 쓴다. 원본 babyai/scripts/make_agent_demos.py 도 기본은 별도
+    캡을 두지 않고 이 값에만 의존한다. max_steps 를 주면 그 값으로 덮어써서
+    짧은 궤적만 남기는 실험(예: 10~50 스텝) 등에 쓸 수 있다.
 
-    (level, seed) 만으로 완전히 결정적이다. 난수를 쓰지 않는다.-> 고민필요"""
+    (level, seed) 만으로 완전히 결정적이다. 난수를 쓰지 않는다."""
     env = gym.make(level)
     try:
         obs, _ = env.reset(seed=seed)
@@ -256,7 +257,7 @@ def rollout(level: str, seed: int) -> Episode | None:
         ep.instr_types = [type(x).__name__ for x in instr_leaves(u.instrs)]
         bot = BabyAIBot(env)
 
-        for _ in range(u.max_steps):
+        for _ in range(max_steps if max_steps is not None else u.max_steps):
             try:
                 a = int(bot.replan())
             except Exception:
@@ -370,6 +371,8 @@ def generate(cfg: dict, out_dir: Path | None = None, verbose: bool = True) -> di
     """steps / labels / manifest 3 파일을 쓴다. 레벨 하나당 한 디렉토리."""
     out = Path(out_dir or cfg["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
+    max_steps = cfg.get("max_steps")            # None -> rollout 이 env 값을 씀
+    min_steps = cfg.get("min_steps", MIN_STEPS)
     kept = tried = 0
     drop = {"bot_fail": 0, "too_short": 0}
     last_seed = 0
@@ -381,11 +384,11 @@ def generate(cfg: dict, out_dir: Path | None = None, verbose: bool = True) -> di
             if kept >= cfg["n"]:
                 break
             last_seed = seed
-            ep = rollout(cfg["level"], seed)
+            ep = rollout(cfg["level"], seed, max_steps)
             tried += 1
             if ep is None:
                 drop["bot_fail"] += 1
-            elif ep.n < MIN_STEPS:
+            elif ep.n < min_steps:
                 drop["too_short"] += 1
             else:
                 fs.write(json.dumps(steps_record(ep), ensure_ascii=False) + "\n")
@@ -418,10 +421,13 @@ def generate(cfg: dict, out_dir: Path | None = None, verbose: bool = True) -> di
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("config")
-    p.add_argument("--n", type=int, help="config 덮어쓰기")
-    p.add_argument("--level", help="config 덮어쓰기")
-    p.add_argument("--out", help="out_dir 덮어쓰기")
+    p.add_argument("--n", type=int)
+    p.add_argument("--level")
+    p.add_argument("--out")
     p.add_argument("--seed", type=int, help="마스터 시드 덮어쓰기")
+    p.add_argument("--max-steps", type=int,
+                   help="config 덮어쓰기. 안 주면 env 자체 예산(576~1152) 사용")
+    p.add_argument("--min-steps", type=int, help="config 덮어쓰기 (기본 3)")
     a = p.parse_args()
     cfg = load_cfg(a.config)
     if a.n:
@@ -431,6 +437,10 @@ def main():
         cfg["out_dir"] = f"data/{a.level}"
     if a.seed is not None:
         cfg["seed"] = a.seed
+    if a.max_steps is not None:
+        cfg["max_steps"] = a.max_steps
+    if a.min_steps is not None:
+        cfg["min_steps"] = a.min_steps
     generate(cfg, Path(a.out) if a.out else None)
 
 

@@ -3,10 +3,6 @@
     python datagen/case.py data/bosslevel
     python datagen/case.py data/bosslevel --cases c1 c2
 
-정보량이 단조 증가하는 일곱 조건으로 step 텍스트를 다시 쓴다.
-출력 스키마는 train.jsonl 과 동일하므로 소비자(latent/) 는 조건에 무관하게
-같은 로더를 쓴다.
-
     c7  행동만                              라벨 불필요. 하한(degenerate floor).
     c1  관측만                              라벨 불필요. 본 실험.
     c2  관측 + 행동                         라벨 불필요.
@@ -76,7 +72,7 @@ def full_subgoal_phrase(kind, target, reason) -> str:
             "Pickup": " to take it."}.get(reason or "", ".")
     return f"I am heading to {where}{tail}"
 
-
+# json 파싱
 def build_text(cond: str, obs: str, action: str | None,
                kind=None, target=None, reason=None) -> str:
     """조건에 맞는 step 텍스트. action 이 None 이면 terminal 이다."""
