@@ -9,3 +9,4 @@ test/
 .gitignore
 analysis/
 view_epi.py
+*.jsonl
