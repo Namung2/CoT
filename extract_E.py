@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 DATA_DIR = Path("data")
@@ -51,9 +52,9 @@ def extract_hidden_states(steps: list[str]):
     E_B = {}      # 방법 B: x_t 구간 토큰만,       n_t x d
 
     for t, step in enumerate(steps):
-        input = step if t == 0 else "\n" + step
+        text = step if t == 0 else "\n" + step
         s = len(ids)                                        # x_t 시작 위치
-        ids.extend(tok(input, add_special_tokens=(t == 0)).input_ids)
+        ids.extend(tok(text, add_special_tokens=(t == 0)).input_ids)
         e = len(ids)                                        # == N_t
 
         H = model(torch.tensor([ids], device=model.device),
@@ -65,9 +66,10 @@ def extract_hidden_states(steps: list[str]):
     return E_A, E_B
 
 def run(level: str | None = None, case: str | None = None):
-    opened: set[Path] = set()  
-    
-    for path, sample in load_samples(level=level, case=case):
+    opened: set[Path] = set()
+
+    samples = list(load_samples(level=level, case=case))
+    for path, sample in tqdm(samples, desc="samples", unit="sample"):
         steps, meta = build_babyai(sample)
         E_A, E_B = extract_hidden_states(steps)
 
@@ -93,4 +95,4 @@ def run(level: str | None = None, case: str | None = None):
     print(f"saved under {OUT_DIR}")
 
 if __name__ == "__main__":
-    run(level="gotoseq", case="c1")
+    run(level="gotoseq_10to50", case="c3")

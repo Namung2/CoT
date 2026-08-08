@@ -10,4 +10,7 @@ test/
 analysis/
 view_epi.py
 *.jsonl
-
+*.csv
+*.png
+*.npz
+*.pt
