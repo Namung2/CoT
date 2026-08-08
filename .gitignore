@@ -11,3 +11,4 @@ analysis/
 view_epi.py
 *.jsonl
 
+zip/
