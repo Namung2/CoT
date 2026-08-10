@@ -8,8 +8,8 @@ from spectral import spectral_run
 ROOT = Path(__file__).resolve().parent.parent
 
 DATA_DIR = ROOT / "baby_ai" / "data"
-HIDDEN_DIR = ROOT / "result" / "hidden_states"
-SPECTRAL_DIR = ROOT / "result" / "spectral_states"
+HIDDEN_DIR = ROOT / "state" / "hidden_states"
+SPECTRAL_DIR = ROOT / "state" / "spectral_states"
 
 LEVEL = "gotoseq_10to50_by_step"
 CASE = "c3"

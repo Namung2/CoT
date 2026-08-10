@@ -15,3 +15,5 @@ zip/
 *.csv
 *.png
 *.npz
+*.log
+
