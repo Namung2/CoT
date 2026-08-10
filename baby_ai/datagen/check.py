@@ -20,7 +20,7 @@ import minigrid  # noqa: F401
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).parent))
-from gen import ACT_ID
+from baby_ai.datagen.gen import ACT_ID
 
 # state 후보 조합. 확정이 아니라 탐색용.
 CANDIDATES = {
