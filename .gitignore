@@ -12,3 +12,6 @@ view_epi.py
 *.jsonl
 *.pt
 zip/
+*.csv
+*.png
+*.npz

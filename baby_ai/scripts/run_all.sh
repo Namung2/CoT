@@ -4,11 +4,11 @@
 #       총 2 레벨 x 7 조건 = 14 케이스
 set -e
 N=${1:-5000}
-for cfg in configs/gotoseq.yaml configs/bosslevel.yaml; do
+for cfg in baby_ai/configs/gotoseq.yaml baby_ai/configs/bosslevel.yaml; do
   echo "=== $cfg ==="
-  python datagen/gen.py "$cfg" --n "$N"
+  python baby_ai/datagen/gen.py "$cfg" --n "$N"
 done
 for d in data/gotoseq data/bosslevel; do
   echo "=== cases: $d ==="
-  python datagen/case.py "$d"
+  python baby_ai/datagen/case.py "$d"
 done

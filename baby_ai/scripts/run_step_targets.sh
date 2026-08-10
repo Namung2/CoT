@@ -6,12 +6,12 @@
 set -e
 N=${1:-1000}
 
-for level_cfg in configs/gotoseq.yaml configs/bosslevel.yaml; do
+for level_cfg in baby_ai/configs/gotoseq.yaml baby_ai/configs/bosslevel.yaml; do
   level=$(basename "$level_cfg" .yaml)
   for steps in 10 20 30 40 50; do
     out="data/${level}_step${steps}"
     echo "=== $level step=$steps -> $out ==="
-    python datagen/gen.py "$level_cfg" --n "$N" --max-steps "$steps" --min-steps "$steps" --out "$out"
-    python datagen/case.py "$out" --cases c3
+    python baby_ai/datagen/gen.py "$level_cfg" --n "$N" --max-steps "$steps" --min-steps "$steps" --out "$out"
+    python baby_ai/datagen/case.py "$out" --cases c3
   done
 done
