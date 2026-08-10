@@ -114,8 +114,8 @@ def extract_run(episodes: list, data_dir: Path, out_root: Path):
 
         sid = meta["id"]
         torch.save({"E": E,   "method": "full", "model": MODEL}, out_dir / "full" / f"{sid}.pt")
-        torch.save({"E": E_A, "method": "A",    "model": MODEL}, out_dir / "A"    / f"{sid}.pt")
-        torch.save({"E": E_B, "method": "B",    "model": MODEL}, out_dir / "B"    / f"{sid}.pt")
+        #torch.save({"E": E_A, "method": "A",    "model": MODEL}, out_dir / "A"    / f"{sid}.pt")
+        #torch.save({"E": E_B, "method": "B",    "model": MODEL}, out_dir / "B"    / f"{sid}.pt")
 
         meta_path = out_dir / "meta.jsonl"
         mode = "a" if meta_path in opened else "w"
