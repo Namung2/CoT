@@ -10,5 +10,5 @@ test/
 analysis/
 view_epi.py
 *.jsonl
-
+*.pt
 zip/
