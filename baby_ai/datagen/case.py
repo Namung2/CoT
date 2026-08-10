@@ -99,8 +99,29 @@ def read_jsonl(p: Path) -> list[dict]:
         return [json.loads(l) for l in f if l.strip()]
 
 
-def build(data_dir: Path, cases: list[str], verbose: bool = True) -> dict:
-    """cases/cN.jsonl 을 쓴다. 스키마는 train.jsonl 과 동일."""
+def split_by_step(rows: list[dict], out_dir: Path, verbose: bool = True) -> dict[int, int]:
+    """rows 를 n_steps 값별로 <out_dir>/<n>step.jsonl 로 쪼갠다."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    buckets: dict[int, list[dict]] = {}
+    for r in rows:
+        buckets.setdefault(r["n_steps"], []).append(r)
+
+    counts = {}
+    for n, group in sorted(buckets.items()):
+        path = out_dir / f"{n}step.jsonl"
+        with path.open("w") as f:
+            for row in group:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        counts[n] = len(group)
+        if verbose:
+            print(f"    {n}step: {len(group)} eps -> {path}")
+    return counts
+
+
+def build(data_dir: Path, cases: list[str], verbose: bool = True,
+          split_steps: bool = False) -> dict:
+    """cases/cN.jsonl 을 쓴다. 스키마는 train.jsonl 과 동일.
+    split_steps 면 cases/by_step/cN/<n>step.jsonl 로도 추가로 쪼갠다."""
     steps = read_jsonl(data_dir / "train.jsonl")
     need = any(c in NEEDS_LABELS for c in cases)
     labels = {r["id"]: r for r in read_jsonl(data_dir / "train.labels.jsonl")} \
@@ -134,6 +155,8 @@ def build(data_dir: Path, cases: list[str], verbose: bool = True) -> dict:
         written[c] = len(rows)
         if verbose:
             print(f"  {c}: {len(rows)} eps -> {path}  ({CONDITIONS[c]})")
+        if split_steps:
+            split_by_step(rows, out_dir / "by_step" / c, verbose)
     return written
 
 
@@ -143,8 +166,10 @@ def main():
     p.add_argument("data_dir")
     p.add_argument("--cases", nargs="+", default=list(CONDITIONS),
                    choices=list(CONDITIONS))
+    p.add_argument("--split-steps", action="store_true",
+                   help="cases/cN.jsonl 을 n_steps 별로 cases/by_step/cN/ 밑에 추가로 쪼갠다")
     a = p.parse_args()
-    build(Path(a.data_dir), a.cases)
+    build(Path(a.data_dir), a.cases, split_steps=a.split_steps)
 
 
 if __name__ == "__main__":
