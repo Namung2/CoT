@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, adjusted_rand_score
-from openTSNE import TSNE
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_ROOT = Path(__file__).resolve().parent
@@ -77,14 +76,6 @@ def build_pool(emb_path: Path, meta: dict, level: str, case: str):
             np.array(traj_ids), np.array(ts))
 
 
-def compute_progress(traj_ids, ts):
-    prog = np.zeros(len(ts), dtype=float)
-    for sid in np.unique(traj_ids):
-        mm = traj_ids == sid
-        prog[mm] = ts[mm] / max(int(ts[mm].max()), 1)
-    return prog
-
-
 def traj_matrices(X, traj_ids, ts):
     """궤적별 (정규화된 (T,dim) 행렬, 스텝순) — mission 제외"""
     out = {}
@@ -99,48 +90,6 @@ def traj_matrices(X, traj_ids, ts):
 
 
 # ================= A. 전역 구조 =================
-
-def tsne_block(Xp, labels, prog, ts, traj_ids, case, out_dir):
-    Z = np.asarray(TSNE(n_components=2, perplexity=30, initialization="pca",
-                        n_jobs=-1, random_state=SEED).fit(Xp))
-    np.savez(out_dir / f"tsne_cache_{case}.npz",
-             Z=Z, labels=labels, ts=ts, traj_ids=traj_ids)
-    m = ts > 0
-
-    # ① action
-    plt.figure(figsize=(8, 7))
-    for a in sorted(set(labels)):
-        mm = labels == a
-        plt.scatter(Z[mm, 0], Z[mm, 1], s=5, alpha=0.5,
-                    label=f"{a} ({int(mm.sum())})")
-    plt.legend(markerscale=3, fontsize=8)
-    plt.title(f"t-SNE by action  [{case}]")
-    plt.tight_layout(); plt.savefig(out_dir / f"tsne_action_{case}.png", dpi=150)
-    plt.close()
-
-    # ② progress
-    plt.figure(figsize=(8, 7))
-    sc = plt.scatter(Z[m, 0], Z[m, 1], c=prog[m], s=3, cmap="viridis", alpha=0.6)
-    plt.colorbar(sc, label="progress t/T")
-    plt.title(f"t-SNE by progress  [{case}]")
-    plt.tight_layout(); plt.savefig(out_dir / f"tsne_progress_{case}.png", dpi=150)
-    plt.close()
-
-    # ③ trajectory highlight (20개)
-    rng = np.random.RandomState(SEED)
-    sids = np.unique(traj_ids)
-    picked = set(rng.choice(sids, size=min(20, len(sids)), replace=False).tolist())
-    plt.figure(figsize=(8, 7))
-    bg = ~np.isin(traj_ids, list(picked))
-    plt.scatter(Z[bg & m, 0], Z[bg & m, 1], s=2, color="lightgray", alpha=0.3)
-    cmap = plt.get_cmap("tab20")
-    for i, sid in enumerate(sorted(picked)):
-        mm = (traj_ids == sid) & m
-        plt.scatter(Z[mm, 0], Z[mm, 1], s=6, color=cmap(i % 20), alpha=0.9)
-    plt.title(f"t-SNE, 20 trajectories highlighted  [{case}]")
-    plt.tight_layout(); plt.savefig(out_dir / f"tsne_traj_{case}.png", dpi=150)
-    plt.close()
-
 
 def kmeans_metrics(Xp, labels):
     n_clusters = len(set(labels))
@@ -307,10 +256,8 @@ def run_case(level, case, method, data_dir: Path, emb_dir: Path, out_dir: Path):
     ev = float(pca.explained_variance_ratio_.sum())
     print(f"  PCA -> {Xp.shape[1]} dims (explained var {ev:.3f})")
 
-    prog = compute_progress(traj_ids, ts)
     trajs = traj_matrices(X, traj_ids, ts)
 
-    tsne_block(Xp, labels, prog, ts, traj_ids, case, out_dir)
     sil, ari_all, ari_wo, n_clusters, n_clusters_wo = kmeans_metrics(Xp, labels)
     rep_heatmaps(trajs, case, out_dir)
     avg_sim_heatmap(trajs, case, out_dir)
@@ -335,7 +282,7 @@ def run_case(level, case, method, data_dir: Path, emb_dir: Path, out_dir: Path):
 
 
 def run_level(level, method, data_dir: Path, emb_dir: Path, out_root: Path):
-    out_dir = out_root / f"analysis2_{level}"
+    out_dir = out_root / f"analysis_{level}"
     out_dir.mkdir(exist_ok=True)
     cases = discover_cases(data_dir, level)
     if not cases:
@@ -361,7 +308,7 @@ def main():
                     help="쉼표로 구분한 레벨 이름 목록. 생략 시 data-dir에서 "
                          "*_step<N> 패턴을 자동 탐색")
     ap.add_argument("--out", default=str(OUT_ROOT),
-                    help="analysis2_<level>/ 들이 생성될 상위 디렉토리 (기본: analyze/)")
+                    help="analysis_<level>/ 들이 생성될 상위 디렉토리 (기본: analyze/)")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -379,7 +326,7 @@ def main():
     for level in levels:
         all_rows.extend(run_level(level, args.method, data_dir, emb_dir, out_root))
 
-    combined_path = out_root / "analysis2_summary.csv"
+    combined_path = out_root / "analysis_summary.csv"
     with open(combined_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
         w.writeheader(); w.writerows(all_rows)
