@@ -105,7 +105,7 @@ def extract_run(episodes: list, data_dir: Path, out_root: Path):
     for path,episode in tqdm(episodes, desc="episodes", unit="episode"):
         steps, meta = build_babyai(episode)
         E = extract_full_sequence_pass(steps)
-        E_A, E_B = extract_cumulative_prefix_passes(steps)
+        #E_A, E_B = extract_cumulative_prefix_passes(steps)
 
         rel = path.relative_to(data_dir).with_suffix("")
         out_dir = out_root / rel

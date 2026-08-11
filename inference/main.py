@@ -18,7 +18,6 @@ METHODS = ("full",)
 
 if __name__ == "__main__":
     episodes = load_episodes(DATA_DIR, level=LEVEL, case=CASE)
-    print(f"{len(episodes)} episodes")
     extract_run(episodes, DATA_DIR, HIDDEN_DIR)
 
     # 원본 jsonl 파일 하나당 hidden state 서브트리 하나 (예: gotoseq_step10/cases/c3)
