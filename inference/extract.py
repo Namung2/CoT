@@ -8,15 +8,26 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 MODEL = "Qwen/Qwen2.5-3B-Instruct"
-tok = AutoTokenizer.from_pretrained(MODEL)
-model = AutoModel.from_pretrained(  # lm_head 없음 → logits 미계산
-    MODEL, dtype=torch.bfloat16, device_map="auto"
-)
-model.eval()
-print("device:", model.device)
+tok = None
+model = None
+
+
+def ensure_model():
+    """import 시점이 아니라 실제로 필요할 때만 모델을 올린다."""
+    global tok, model
+    if model is None:
+        tok = AutoTokenizer.from_pretrained(MODEL)
+        model = AutoModel.from_pretrained(  # lm_head 없음 → logits 미계산
+            MODEL, dtype=torch.bfloat16, device_map="auto"
+        )
+        model.eval()
+        print("device:", model.device)
+    return tok, model
+
 
 ## full
 def verify_spans(steps: list[str]):
+    ensure_model()
     ids, spans = [], []
     for j, step in enumerate(steps):
         text = step if j == 0 else "\n" + step
@@ -62,6 +73,7 @@ def build_babyai(episode: dict):
 
 @torch.no_grad()
 def extract_full_sequence_pass(steps: list[str]):
+    ensure_model()
     ids = [] # 토큰 id
     spans = [] # 각 step의 범위를 기록
     
@@ -82,6 +94,7 @@ def extract_full_sequence_pass(steps: list[str]):
 
 @torch.no_grad()
 def extract_cumulative_prefix_passes(steps: list[str]):
+    ensure_model()
     ids = []      # 누적 토큰 id
     E_A = {}      # 방법 A: 입력 시퀀스 전체 N_t x d
     E_B = {}      # 방법 B: x_t 구간만      n_t x d
