@@ -12,7 +12,7 @@ DATA_DIR = ROOT / "data"
 HIDDEN_DIR = ROOT / "result" / "hidden_states"
 SPECTRAL_DIR = ROOT / "result" / "spectral_states"
 
-LEVEL = None   # "gotoseq_*", "*_step*", None(전부) 도 가능
+LEVEL = "bosslevel_step50"
 CASE = "cases"
 METHODS = ("B",)
 
