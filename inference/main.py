@@ -12,11 +12,11 @@ DATA_DIR = ROOT / "data"
 HIDDEN_DIR = ROOT / "result" / "hidden_states"
 SPECTRAL_DIR = ROOT / "result" / "spectral_states"
 
-LEVEL = None   # "gotoseq_*", "*_step*", None(전부) 도 가능
+LEVEL = "bosslevel_step50"
 CASE = "cases"
-METHODS = ("full",)
+METHODS = ("B",)
 
-EXTRACT = False     # False면 hidden state 재사용, 스펙트럴만 다시 계산
+EXTRACT = True     # False면 hidden state 재사용, 스펙트럴만 다시 계산
 K = 8
 SCALES = (True, False)      # E_t를 sqrt(n_t)로 정규화할지
 FIX_SIGNS = (True, False)   # 고유벡터 부호를 고정할지
