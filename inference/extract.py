@@ -117,8 +117,8 @@ def extract_run(episodes: list, data_dir: Path, out_root: Path):
 
     for path,episode in tqdm(episodes, desc="episodes", unit="episode"):
         steps, meta = build_babyai(episode)
-        E = extract_full_sequence_pass(steps)
-        #E_A, E_B = extract_cumulative_prefix_passes(steps)
+        #E = extract_full_sequence_pass(steps)
+        E_A, E_B = extract_cumulative_prefix_passes(steps)
 
         rel = path.relative_to(data_dir).with_suffix("")
         out_dir = out_root / rel
@@ -126,9 +126,9 @@ def extract_run(episodes: list, data_dir: Path, out_root: Path):
             (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
         sid = meta["id"]
-        torch.save({"E": E,   "method": "full", "model": MODEL}, out_dir / "full" / f"{sid}.pt")
-        #torch.save({"E": E_A, "method": "A",    "model": MODEL}, out_dir / "A"    / f"{sid}.pt")
-        #torch.save({"E": E_B, "method": "B",    "model": MODEL}, out_dir / "B"    / f"{sid}.pt")
+        #torch.save({"E": E,   "method": "full", "model": MODEL}, out_dir / "full" / f"{sid}.pt")
+        torch.save({"E": E_A, "method": "A",    "model": MODEL}, out_dir / "A"    / f"{sid}.pt")
+        torch.save({"E": E_B, "method": "B",    "model": MODEL}, out_dir / "B"    / f"{sid}.pt")
 
         meta_path = out_dir / "meta.jsonl"
         mode = "a" if meta_path in opened else "w"
