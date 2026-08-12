@@ -43,9 +43,9 @@ def run(level: str, case: str, tag: str, method: str,
     sids = np.unique(traj_ids)
     picked = rng.choice(sids, size=min(n_trajs, len(sids)), replace=False)
 
-    ncols = 3
+    ncols = min(3, len(picked))
     nrows = int(np.ceil(len(picked) / ncols))
-    fig = plt.figure(figsize=(5 * ncols, 4.5 * nrows))
+    fig = plt.figure(figsize=(6 * ncols, 5.5 * nrows))
     cmap = plt.get_cmap("viridis")
 
     for k, sid in enumerate(picked):
