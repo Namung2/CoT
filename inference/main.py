@@ -14,7 +14,7 @@ SPECTRAL_DIR = ROOT / "result" / "spectral_states"
 
 LEVEL = None   # "gotoseq_*", "*_step*", None(전부) 도 가능
 CASE = "cases"
-METHODS = ("full",)
+METHODS = ("B",)
 
 EXTRACT = False     # False면 hidden state 재사용, 스펙트럴만 다시 계산
 K = 8
