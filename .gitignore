@@ -16,3 +16,4 @@ zip/
 *.png
 *.npz
 key.txt
+*.log

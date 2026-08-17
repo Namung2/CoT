@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import torch
@@ -48,29 +47,35 @@ def episode_embeddings(E: dict[int, torch.Tensor], k: int, scale: bool, fix_sign
         e[t], lam[t], V[t] = spectral_embedding(E[t].to(DEVICE), k, scale, fix_sign)
     return e, lam, V
 
-def spectral_run(method: str, data_dir: Path, dst: Path,
-                 k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
-    
-    files = sorted(data_dir.glob("*.pt"))
-    if not files:
-        raise FileNotFoundError(f"no .pt in {data_dir}")
-    print(f"{len(files)} episodes from {data_dir}  device={DEVICE}")
+@torch.no_grad()
+def spectral_run(src: Path, k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
+    data = torch.load(src, map_location="cpu", weights_only=False)
+    e, lam, V = episode_embeddings(data["E"], k, scale, fix_sign)
+    return {"k": k, "scale": scale, "fix_sign": fix_sign,
+            "src": str(src), "model": data["model"],
+            "e": e, "eigvals": lam, "V": V}
 
-    result = {"k": k, "scale": scale, "fix_sign": fix_sign, "method": method,
-              "src": str(data_dir),
+
+def spectral_dir_run(src_dir: Path, dst: Path, method: str,
+                     k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
+    """디렉터리 안의 에피소드 .pt를 전부 돌려 하나로 합쳐 저장."""
+    files = sorted(src_dir.glob("*.pt"))
+    if not files:
+        raise FileNotFoundError(f"no .pt in {src_dir}")
+
+    merged = {"k": k, "scale": scale, "fix_sign": fix_sign, "method": method,
+              "src": str(src_dir),
               "model": None, "e": {}, "eigvals": {}, "V": {}}
 
-    t0 = time.time()
-    for f in tqdm(files, desc=data_dir.name, unit="ep"):
-        data = torch.load(f, map_location="cpu", weights_only=False)
-        if result["model"] is None:
-            result["model"] = data["model"]
-        e, lam, V = episode_embeddings(data["E"], k, scale, fix_sign)
-        result["e"][f.stem] = e
-        result["eigvals"][f.stem] = lam
-        result["V"][f.stem] = V
-    print(f"done in {time.time() - t0:.1f}s")
+    for f in tqdm(files, desc=dst.stem, unit="ep"):  # 설정별로 구분되도록 dst 이름 사용
+        out = spectral_run(f, k, scale, fix_sign)
+        if merged["model"] is None:
+            merged["model"] = out["model"]
+        merged["e"][f.stem] = out["e"]
+        merged["eigvals"][f.stem] = out["eigvals"]
+        merged["V"][f.stem] = out["V"]
 
     dst.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(result, dst)
+    torch.save(merged, dst)
     print(f"saved {dst}")
+    return merged
