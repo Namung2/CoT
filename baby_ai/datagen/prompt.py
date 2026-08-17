@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import hashlib
 
-from .babyai_env import ACTIONS
+from .babyai_env import ACTIONS, make_episode
 
 # =============================================================== 공통 조각
 
@@ -156,7 +156,9 @@ PROMPTS = {
 }
 
 # 스키마/예시 플레이스홀더. 모델이 그대로 베꼈는지 score.py 가 감사한다.
-SCHEMA_TOKENS = {"action", "actions", "action1", "action2", "action3"}
+# score.py 의 정규화가 숫자를 지우므로 ("action1" -> "action") 번호 붙은 형태는
+# 넣지 않는다 — 넣어도 도달하지 않고, "action" 하나로 다 잡힌다.
+SCHEMA_TOKENS = {"action", "actions"}
 
 PROBE_SEED = 0
 
@@ -201,8 +203,6 @@ def prompt_fingerprint(level: str, obs_mode: str, prompt: str = "bb") -> str:
     사고를 막는 가드다. 일부러 바꿔 대조하는 것(obs_mode / prompt / generator 축)은
     디렉토리를 갈라서 한다.
     """
-    from .babyai_env import make_episode          # 순환 import 회피
-
     ep = make_episode(level, PROBE_SEED, obs_mode)
     msgs = build_messages(ep["mission"], ep["obs_text"], obs_mode, prompt)
     blob = "\n".join([msgs[0]["content"], ",".join(ACTIONS)])
