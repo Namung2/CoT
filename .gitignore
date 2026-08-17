@@ -15,5 +15,5 @@ zip/
 *.csv
 *.png
 *.npz
+key.txt
 *.log
-
