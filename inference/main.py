@@ -1,45 +1,63 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
-from extract import load_episodes, extract_run
-from spectral import spectral_dir_run
+from extract import EXTRACTORS, extract_run
+from spectral import spectral_run
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# 여기 세 경로만 바꾸면 데이터/hidden state/spectral 출력 위치가 전부 바뀝니다.
-DATA_DIR = ROOT / "data"
-HIDDEN_DIR = ROOT / "result" / "hidden_states"
-SPECTRAL_DIR = ROOT / "result" / "spectral_states"
+def parse_args():
+    p = argparse.ArgumentParser(description="CoT hidden state extraction + spectral embedding")
 
-LEVEL = "bosslevel_step50"
-CASE = "cases"
-METHODS = ("B",)
+    # 데이터 선택
+    p.add_argument("--case", required=True, help="e.g. c3")
+    p.add_argument("--level", required=True, help="e.g. gotoseq")
+    p.add_argument("--step", required=True, help="e.g. step10")
+    p.add_argument("--methods", nargs="+", default=["full_sequence"],
+                   choices=list(EXTRACTORS))
 
-EXTRACT = True     # False면 hidden state 재사용, 스펙트럴만 다시 계산
-K = 8
-SCALES = (True, False)      # E_t를 sqrt(n_t)로 정규화할지
-FIX_SIGNS = (True, False)   # 고유벡터 부호를 고정할지
+    # 경로
+    p.add_argument("--data-dir", type=Path, default=ROOT / "observed" / "reasoning_trajectory" / "success")
+    p.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
+    p.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
+
+    # 단계 제어
+    p.add_argument("--no-extract", dest="extract", action="store_false",
+                   help="hidden state 재사용, 스펙트럴만 재계산")
+    p.add_argument("--no-spectral", dest="spectral", action="store_false",
+                   help="추출만 하고 종료")
+
+    # 스펙트럴 설정
+    p.add_argument("-k", type=int, nargs="+", default=[8])
+    p.add_argument("--scale", type=str, nargs="+", default=["true"], choices=["true", "false"])
+    p.add_argument("--fix-sign", type=str, nargs="+", default=["true"], choices=["true", "false"])
+
+    a = p.parse_args()
+    a.scale = [s == "true" for s in a.scale]
+    a.fix_sign = [s == "true" for s in a.fix_sign]
+    return a
 
 
-def tag_of(k: int, scale: bool, fix_sign: bool):
-    return f"k{k}{'_scaled' if scale else ''}{'_signfix' if fix_sign else ''}"
+def main():
+    a = parse_args()
+
+    for method in a.methods:
+        if a.extract:
+            extract_run(data_root=a.data_dir, out_root=a.hidden_dir,
+                        case=a.case, level=a.level, step=a.step, method=method)
+
+        if not a.spectral:
+            continue
+
+        for k in a.k:
+            for scale in a.scale:
+                for fix_sign in a.fix_sign:
+                    spectral_run(data_root=a.hidden_dir, out_root=a.spectral_dir,
+                                 case=a.case, level=a.level, step=a.step, method=method,
+                                 k=k, scale=scale, fix_sign=fix_sign)
+
 
 if __name__ == "__main__":
-    episodes = load_episodes(DATA_DIR, level=LEVEL, case=CASE)
-    if EXTRACT:
-        extract_run(episodes, DATA_DIR, HIDDEN_DIR)
-
-    # 원본 jsonl 파일 하나당 hidden state 서브트리 하나 (예: gotoseq_step10/cases/c3)
-    rels = sorted({path.relative_to(DATA_DIR).with_suffix("") for path, _ in episodes})
-    for rel in rels:
-        for method in METHODS:
-            for scale in SCALES:
-                for fix_sign in FIX_SIGNS:
-                    tag = tag_of(K, scale, fix_sign)
-                    spectral_dir_run(
-                        src_dir=HIDDEN_DIR / rel / method,
-                        dst=SPECTRAL_DIR / rel / f"{method}_{tag}.pt",
-                        method=method,
-                        k=K, scale=scale, fix_sign=fix_sign,
-                    )
+    main()

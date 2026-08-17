@@ -5,8 +5,6 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parent.parent
-
 K_EIG = 8
 SCALE = True      # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
 FIX_SIGN = True   # 고유벡터 부호 고정
@@ -47,35 +45,35 @@ def episode_embeddings(E: dict[int, torch.Tensor], k: int, scale: bool, fix_sign
         e[t], lam[t], V[t] = spectral_embedding(E[t].to(DEVICE), k, scale, fix_sign)
     return e, lam, V
 
-@torch.no_grad()
-def spectral_run(src: Path, k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
-    data = torch.load(src, map_location="cpu", weights_only=False)
-    e, lam, V = episode_embeddings(data["E"], k, scale, fix_sign)
-    return {"k": k, "scale": scale, "fix_sign": fix_sign,
-            "src": str(src), "model": data["model"],
-            "e": e, "eigvals": lam, "V": V}
+def load_hidden_states(data_dir: Path, case: str, level: str, step: str, method: str):
+    target = data_dir / case / level / step / method
+    if not target.is_dir():
+        raise FileNotFoundError(f"no such directory: {target}")
 
-
-def spectral_dir_run(src_dir: Path, dst: Path, method: str,
-                     k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
-    """디렉터리 안의 에피소드 .pt를 전부 돌려 하나로 합쳐 저장."""
-    files = sorted(src_dir.glob("*.pt"))
+    files = sorted(target.glob("*.pt"))
     if not files:
-        raise FileNotFoundError(f"no .pt in {src_dir}")
+        raise FileNotFoundError(f"no .pt in {target}")
+    return files
 
-    merged = {"k": k, "scale": scale, "fix_sign": fix_sign, "method": method,
-              "src": str(src_dir),
-              "model": None, "e": {}, "eigvals": {}, "V": {}}
+@torch.no_grad()
+def spectral_run(data_root: Path, out_root: Path, case: str, level: str, step: str, method: str,
+                 k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
 
-    for f in tqdm(files, desc=dst.stem, unit="ep"):  # 설정별로 구분되도록 dst 이름 사용
-        out = spectral_run(f, k, scale, fix_sign)
-        if merged["model"] is None:
-            merged["model"] = out["model"]
-        merged["e"][f.stem] = out["e"]
-        merged["eigvals"][f.stem] = out["eigvals"]
-        merged["V"][f.stem] = out["V"]
+    data_root = data_root.resolve()
+    files = load_hidden_states(data_root, case, level, step, method)
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(merged, dst)
-    print(f"saved {dst}")
-    return merged
+    tag = f"k{k}" + ("_scaled" if scale else "") + ("_signfix" if fix_sign else "")
+    rel = Path(case) / level / step
+    out_dir = out_root / rel / method / tag
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in tqdm(files, desc=f"{rel}/{method}/{tag}", unit="ep"):
+        data = torch.load(f, map_location="cpu", weights_only=False)
+        e, lam, V = episode_embeddings(data["E"], k, scale, fix_sign)
+
+        out_path = out_dir / f.name
+        torch.save({"k": k, "scale": scale, "fix_sign": fix_sign,
+                    "src": str(f), "model": data["model"],
+                    "e": e, "eigvals": lam, "V": V}, out_path)
+
+    print(f"saved {len(files)} files under {out_dir}")

@@ -13,7 +13,6 @@ model = None
 
 
 def ensure_model():
-    """import 시점이 아니라 실제로 필요할 때만 모델을 올린다."""
     global tok, model
     if model is None:
         tok = AutoTokenizer.from_pretrained(MODEL)
@@ -25,7 +24,6 @@ def ensure_model():
     return tok, model
 
 
-## full
 def verify_spans(steps: list[str]):
     ensure_model()
     ids, spans = [], []
@@ -44,10 +42,13 @@ def verify_spans(steps: list[str]):
         want = steps[t] if t == 0 else "\n" + steps[t]
         print(f"t={t:2d} n_tok={e-s:3d} {'OK ' if got == want else 'MISMATCH'} {got!r}")
 
-def load_episodes(data_dir: Path, level: str | None = None, case: str | None = None):
-    pattern = f"{level or '*'}/**/{case or '*'}/*.jsonl"
+def load_episodes(data_dir: Path, case: str, level: str, step: str):
+    target = data_dir / case / level / step
+    if not target.is_dir():
+        raise FileNotFoundError(f"no such directory: {target}")
+    
     episodes = []
-    for path in sorted(data_dir.glob(pattern)):
+    for path in sorted(target.glob("*.jsonl")):
         with path.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -60,7 +61,7 @@ def build_babyai(episode: dict):
     steps = [s.strip() for s in episode["steps"] if s.strip()] # "일련의 step들로 저장: [step1, step2, step3, ...]"
     terminal = f"Terminal: {episode['terminal'].strip()}" # "terminal: 실제 terminal text"로 저장
 
-    steps = [mission] + steps + [terminal] #mission, sptes, terminal을 list로 합쳐서 저장. 
+    steps = [mission] + steps + [terminal] # mission, sptes, terminal을 list로 합쳐서 저장. 
 
     meta = {
         "id": episode["id"],
@@ -96,44 +97,51 @@ def extract_full_sequence_pass(steps: list[str]):
 def extract_cumulative_prefix_passes(steps: list[str]):
     ensure_model()
     ids = []      # 누적 토큰 id
-    E_A = {}      # 방법 A: 입력 시퀀스 전체 N_t x d
-    E_B = {}      # 방법 B: x_t 구간만      n_t x d
+    E = {}
 
     for t, step in enumerate(steps):
         text = step if t == 0 else "\n" + step
         s = len(ids)                                        # x_t 시작 위치
         ids.extend(tok(text, add_special_tokens=(t == 0)).input_ids)
-        e = len(ids)                                        # == N_t
+        e = len(ids)                                        # N_t
 
         H = model(torch.tensor([ids], device=model.device)).last_hidden_state[0]   # N_t x d
 
-        E_A[t] = H.to(torch.bfloat16).cpu()        # 전체 step만 뽑기
-        E_B[t] = H[s:e].to(torch.bfloat16).cpu()   # 마지막 step만
+        E[t] = H[s:e].to(torch.bfloat16).cpu()   # 마지막 step만
 
-    return E_A, E_B
+    return E
 
-def extract_run(episodes: list, data_dir: Path, out_root: Path):
-    opened: set[Path] = set()
+EXTRACTORS = {
+    "full_sequence": extract_full_sequence_pass,
+    "cumulative_prefix": extract_cumulative_prefix_passes,
+}
 
-    for path,episode in tqdm(episodes, desc="episodes", unit="episode"):
-        steps, meta = build_babyai(episode)
-        #E = extract_full_sequence_pass(steps)
-        E_A, E_B = extract_cumulative_prefix_passes(steps)
+def extract_run(data_root: Path, out_root: Path, case: str, level: str, step: str, method: str):
 
-        rel = path.relative_to(data_dir).with_suffix("")
-        out_dir = out_root / rel
-        for sub in ("full", "A", "B"):
-            (out_dir / sub).mkdir(parents=True, exist_ok=True)
+    if method not in EXTRACTORS:
+        raise ValueError(f"unknown method: {method!r} (choose from {list(EXTRACTORS)})")
+    extractor = EXTRACTORS[method]
 
-        sid = meta["id"]
-        #torch.save({"E": E,   "method": "full", "model": MODEL}, out_dir / "full" / f"{sid}.pt")
-        torch.save({"E": E_A, "method": "A",    "model": MODEL}, out_dir / "A"    / f"{sid}.pt")
-        torch.save({"E": E_B, "method": "B",    "model": MODEL}, out_dir / "B"    / f"{sid}.pt")
+    data_root = data_root.resolve()
+    episodes = load_episodes(data_dir = data_root, case=case, level=level, step=step)
 
-        meta_path = out_dir / "meta.jsonl"
-        mode = "a" if meta_path in opened else "w"
-        opened.add(meta_path)
-        with meta_path.open(mode, encoding="utf-8") as f:
-            f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+    rel = Path(case) / level / step
+    out_dir = out_root / rel / method
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"saved under {out_root}")
+    meta_path = out_root / rel / "meta.jsonl"
+
+    with meta_path.open("w", encoding="utf-8") as mf:
+        for path, episode in tqdm(episodes, desc="episodes", unit="episode"):
+            steps, meta = build_babyai(episode)
+            E = extractor(steps)
+
+            out_path = out_dir / f"{meta['id']}.pt"
+            if out_path.exists():
+                raise FileExistsError(f"id collision: {out_path}")
+            torch.save({"E": E, "method": method, "model": MODEL}, out_path)
+
+            meta["src"] = path.name
+            mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+    print(f"saved {len(episodes)} episodes under {out_dir}")
