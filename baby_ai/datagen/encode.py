@@ -7,12 +7,17 @@
     동일**해야 하는데, 그 조립을 한 곳에서 하는 것이 이 파일이다.
 
     Qwen chat template
-      system    : messages[0]      (생성기 무관, raw.jsonl 에 저장돼 있음)
-      user      : messages[1]
-      assistant : assistant_text   (= 모델이 낸 CoT + 답. prefill 없음)
+      user      : messages[0]      (단일 user 메시지. prompt.build_messages 참조)
+
 
     -> prompt_len 은 assistant 턴 시작 직전까지의 토큰 수.
        token_ids[prompt_len:] 을 디코드하면 assistant_text 와 같아야 한다.
+
+    렌더는 qwen.render_prefix 하나로 한다. generate.py 가 생성 시 쓴 것과 **같은
+    함수**라야 prefix 가 문자 단위로 같다. 특히 Qwen3 hybrid 의 enable_thinking 은
+    prefix 자체를 바꾸므로(빈 <think></think> 주입) 두 곳이 갈리면 prompt_len 이
+    어긋난다. claude 셀도 같은 값으로 렌더한다 — 두 셀의 prefix 가 같아야 generator
+    축이 텍스트 저자 차이만 보게 된다.
 
 왜 hidden state 를 저장하지 않는가
     layer 는 스윕 대상인데 전 layer 를 다 저장하면 에피소드당 수백 MB 다.
@@ -38,13 +43,14 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-ENCODER_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+from .qwen import ENABLE_THINKING, MODEL as ENCODER_MODEL, render_prefix
+
 
 
 def encode_one(tok, rec: dict) -> dict:
     """한 레코드를 Qwen 토큰열로. (token_ids, prompt_len, 정합 리포트)"""
-    prefix_text = tok.apply_chat_template(
-        rec["messages"], tokenize=False, add_generation_prompt=True)
+    prefix_text = render_prefix(tok, rec["messages"])
+
     full_text = prefix_text + rec["assistant_text"]
 
     prompt_ids = tok(prefix_text, add_special_tokens=False).input_ids
@@ -66,6 +72,10 @@ def encode_one(tok, rec: dict) -> dict:
         "span_ok": bool(prefix_ok and exact),
         "prefix_ok": bool(prefix_ok),
         "exact": bool(exact),
+        # thinking 이 꺼지지 않았으면 여기에 <think> 가 남는다. 그 경우 assistant_text
+        # 는 CoT 가 아니라 "사고 블록 + 결론"이 되어 분절 전제가 깨진다.
+        "think_leak": "<think>" in rec["assistant_text"],
+
         # 불일치일 때만 원문을 남긴다. 전부 남기면 파일이 두 배가 된다.
         "mismatch": None if exact else {
             "expected": rec["assistant_text"][:400],
@@ -92,18 +102,33 @@ def main():
             g.write(json.dumps(r, ensure_ascii=False) + "\n")
             rows.append(r)
 
+    if not rows:
+        raise SystemExit(f"[중단] {d / 'raw.jsonl'} 에 레코드가 없습니다.")
+
     # manifest 에 인코더를 기록한다. 생성기와 다를 수 있으므로 별도 키다.
     man = d / "manifest.json"
     m = json.loads(man.read_text()) if man.exists() else {}
+    # qwen 셀은 생성 모델 == 인코딩 모델이라야 "자기생성"이다 (CTRLS Algorithm 1).
+    # 어긋나면 조용히 교차생성이 되어 generator 축이 무의미해지므로 드러낸다.
+    if m.get("generator") == "qwen" and m.get("gen_model") != args.encoder:
+        print(f"[경고] 자기생성 전제 위반: gen_model={m.get('gen_model')!r} "
+              f"!= encoder={args.encoder!r}")
     m["encoder"] = {"model": args.encoder,
+                    "enable_thinking": ENABLE_THINKING,
+
                     "transformers_version": __import__("transformers").__version__}
     man.write_text(json.dumps(m, ensure_ascii=False, indent=2))
 
     n = len(rows)
     bad = [r for r in rows if not r["span_ok"]]
+    leak = sum(r["think_leak"] for r in rows)
     nt = sorted(r["n_assistant_tokens"] for r in rows)
     print(f"=== {d}  n={n}  encoder={args.encoder} ===")
     print(f"  span_ok        {n - len(bad)}/{n}")
+    if leak:
+        print(f"  think leak     {leak}/{n}   (<think> 가 assistant_text 에 남음 "
+              f"-> qwen.ENABLE_THINKING 이 먹지 않았다)")
+
     print(f"  prompt_len     median {sorted(r['prompt_len'] for r in rows)[n//2]}")
     print(f"  assistant tok  median {nt[n//2]}  [{nt[0]}, {nt[-1]}]")
     for r in bad[:3]:

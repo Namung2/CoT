@@ -44,9 +44,10 @@ from pathlib import Path
 
 from .babyai_env import ACTIONS, make_episode
 from .prompt import PROBE_SEED, PROMPTS, build_messages, prompt_fingerprint
+from .qwen import ENABLE_THINKING, MODEL as QWEN_MODEL, render_prefix
 
 DEFAULT_LEVEL = "BabyAI-PutNextLocalS6N4-v0"
-QWEN_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+
 CLAUDE_MODEL = "claude-sonnet-5"
 
 
@@ -74,6 +75,10 @@ class QwenGenerator:
     def meta(self, args) -> dict:
         return {
             "generator": "qwen", "gen_model": self.model_name, "dtype": self.dtype,
+            # prefix 문자열을 바꾸는 값이다. encode.py 가 같은 값으로 렌더해야
+            # prompt_len 이 맞으므로 반드시 남긴다.
+            "enable_thinking": ENABLE_THINKING,
+
             "decoding": {"mode": args.decoding, "temperature": args.temperature,
                          "top_k": args.top_k, "max_new_tokens": args.max_new_tokens,
                          "seed_policy": "torch.manual_seed(seed) per generate, batch=1"},
@@ -85,10 +90,13 @@ class QwenGenerator:
         assistant prefill 은 쓰지 않는다. Claude 4.6 이후 모델이 지원하지 않으므로
         (400), Qwen 만 prefill 을 쓰면 두 셀의 prefix 가 달라져 generator 축 대조가
         교란된다. CoT 유발은 프롬프트 본문의 COT_TRIGGER/COT_SCAFFOLD 가 맡는다.
+
+        prefix 렌더는 qwen.render_prefix 하나뿐이다. encode.py 가 같은 함수를 쓰므로
+        생성 시와 인코딩 시의 prefix 가 문자 단위로 같다.
         """
         torch = self.torch
-        text = self.tok.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True)
+        text = render_prefix(self.tok, msgs)
+
         ids = self.tok(text, add_special_tokens=False).input_ids
 
         kw = dict(max_new_tokens=args.max_new_tokens,
@@ -185,7 +193,9 @@ def main():
                          "같은 텍스트에 약 30%% 더 많은 토큰을 쓴다")
     ap.add_argument("--dtype", default="bfloat16", help="qwen 전용")
     ap.add_argument("--device", default="cuda", help="qwen 전용")
-    ap.add_argument("--out", default=None, help="기본 data/{cell}-{generator}")
+    ap.add_argument("--out", default=None,
+                    help="기본 data/{cell}-{generator}-{prompt}")
+
     args = ap.parse_args()
 
     obs_mode = {"P1": "partial", "P2": "full"}[args.cell]
@@ -197,23 +207,34 @@ def main():
     # 프롬프트 지문은 생성기와 무관하다 — 두 생성기가 같은 문자열을 받으므로
     # 셀 간·생성기 간 프롬프트 동일성을 이 값으로 대조할 수 있다.
     phash = prompt_fingerprint(args.level, obs_mode, args.prompt)
+    # 모델 이름을 가드보다 먼저 확정한다. 지문은 프롬프트만 덮으므로(템플릿·미션
+    # 배치·관측 렌더러) 모델을 갈아끼워도 지문은 그대로다. 따로 비교하지 않으면
+    # 기존 seed 는 done 으로 스킵되고 새 seed 만 새 모델이 채워서, 한 raw.jsonl 에
+    # 두 모델의 CoT 가 조용히 섞인다.
+    model_name = args.gen_model or (
+        QWEN_MODEL if args.generator == "qwen" else CLAUDE_MODEL)
+
+
     done = set()
     if raw_path.exists():
         done = {json.loads(l)["id"] for l in open(raw_path) if l.strip()}
     if man_path.exists() and done:
-        old = json.loads(man_path.read_text()).get("prompt_fingerprint")
-        if old and old != phash:
-            raise SystemExit(
-                f"\n[중단] 프롬프트가 바뀌었는데 {out} 에 구 데이터가 있습니다.\n"
-                f"       manifest={old}  현재={phash}\n"
-                f"       (지문은 seed={PROBE_SEED} 를 실제로 렌더한 결과이므로\n"
-                f"        템플릿뿐 아니라 관측 렌더러 변경도 잡습니다.)\n"
-                f"       이어붙이려는 것이었다면:  mv {out} {out}_v0\n")
+        old = json.loads(man_path.read_text())
+        for key, now in (("prompt_fingerprint", phash), ("gen_model", model_name)):
+            was = old.get(key)
+            if was and was != now:
+                raise SystemExit(
+                    f"\n[중단] {out} 에 구 데이터가 있는데 {key} 가 바뀌었습니다.\n"
+                    f"       manifest={was}\n"
+                    f"       현재    ={now}\n"
+                    f"       (지문은 seed={PROBE_SEED} 를 실제로 렌더한 결과라\n"
+                    f"        템플릿뿐 아니라 관측 렌더러 변경도 잡습니다. 다만\n"
+                    f"        모델까지는 못 덮으므로 gen_model 을 따로 봅니다.)\n"
+                    f"       이어붙이려는 것이었다면:  mv {out} {out}_v0\n")
 
-    if args.generator == "qwen":
-        gen = QwenGenerator(args.gen_model or QWEN_MODEL, args.dtype, args.device)
-    else:
-        gen = ClaudeGenerator(args.gen_model or CLAUDE_MODEL)
+    gen = (QwenGenerator(model_name, args.dtype, args.device)
+           if args.generator == "qwen" else ClaudeGenerator(model_name))
+
 
     man_path.write_text(json.dumps({
         "cell": args.cell, "level": args.level, "obs_mode": obs_mode,

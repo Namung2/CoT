@@ -4,7 +4,7 @@ numpy==2.4.4
 PyYAML==6.0.3
 pytest==9.1.1
 torch==2.13.0 
-transformers
+transformers>=4.51        # Qwen3 아키텍처 지원
 accelerate
 tqdm
 matplotlib
