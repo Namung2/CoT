@@ -37,7 +37,7 @@ import re
 import gymnasium as gym
 import minigrid  # noqa: F401  (레벨 등록)
 from minigrid.core.actions import Actions
-from minigrid.core.constants import COLOR_TO_IDX, OBJECT_TO_IDX
+
 
 IDX_TO_COLOR = dict(zip(COLOR_TO_IDX.values(), COLOR_TO_IDX.keys()))
 IDX_TO_OBJECT = dict(zip(OBJECT_TO_IDX.values(), OBJECT_TO_IDX.keys()))
@@ -62,6 +62,7 @@ assert ACT_ID == {
     "pick up": Actions.pickup,
     "drop": Actions.drop,
 }, f"ACTIONS 가 minigrid Actions 0..4 와 어긋났다: {ACT_ID}"
+
 
 # 관측 항목 구분자. GLAM base_agent.generate_prompt 은 ", " 로 한 줄에 잇는다.
 # 우리는 chat message 안에 넣으므로 개행이 더 읽기 쉽지만, 레퍼런스를 따른다.

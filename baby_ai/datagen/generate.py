@@ -47,6 +47,7 @@ from .prompt import PROBE_SEED, PROMPTS, build_messages, prompt_fingerprint
 from .qwen import ENABLE_THINKING, MODEL as QWEN_MODEL, render_prefix
 
 DEFAULT_LEVEL = "BabyAI-PutNextLocalS6N4-v0"
+
 CLAUDE_MODEL = "claude-sonnet-5"
 
 
@@ -77,6 +78,7 @@ class QwenGenerator:
             # prefix 문자열을 바꾸는 값이다. encode.py 가 같은 값으로 렌더해야
             # prompt_len 이 맞으므로 반드시 남긴다.
             "enable_thinking": ENABLE_THINKING,
+
             "decoding": {"mode": args.decoding, "temperature": args.temperature,
                          "top_k": args.top_k, "max_new_tokens": args.max_new_tokens,
                          "seed_policy": "torch.manual_seed(seed) per generate, batch=1"},
@@ -94,6 +96,7 @@ class QwenGenerator:
         """
         torch = self.torch
         text = render_prefix(self.tok, msgs)
+
         ids = self.tok(text, add_special_tokens=False).input_ids
 
         kw = dict(max_new_tokens=args.max_new_tokens,
@@ -192,6 +195,7 @@ def main():
     ap.add_argument("--device", default="cuda", help="qwen 전용")
     ap.add_argument("--out", default=None,
                     help="기본 data/{cell}-{generator}-{prompt}")
+
     args = ap.parse_args()
 
     obs_mode = {"P1": "partial", "P2": "full"}[args.cell]
@@ -209,6 +213,7 @@ def main():
     # 두 모델의 CoT 가 조용히 섞인다.
     model_name = args.gen_model or (
         QWEN_MODEL if args.generator == "qwen" else CLAUDE_MODEL)
+
 
     done = set()
     if raw_path.exists():
@@ -229,6 +234,7 @@ def main():
 
     gen = (QwenGenerator(model_name, args.dtype, args.device)
            if args.generator == "qwen" else ClaudeGenerator(model_name))
+
 
     man_path.write_text(json.dumps({
         "cell": args.cell, "level": args.level, "obs_mode": obs_mode,

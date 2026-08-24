@@ -48,6 +48,7 @@ import hashlib
 
 from .babyai_env import ACTIONS, make_episode
 
+
 # =============================================================== 공통 조각
 
 # 좌표계 설명 (LLM-BabyBench Structured 산문 컨텍스트). full 관측에만 필요하다.

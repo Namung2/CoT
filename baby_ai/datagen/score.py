@@ -41,6 +41,7 @@ def parse_actions(raw: str, prompt: str = "bb"):
     """(actions, mode, n_dropped, reasoning, n_schema, n_boundary_matches).
 
     mode : "answer" | "no_answer"
+
     """
     # 경계 규칙은 변형마다 다르고, 각 레퍼런스의 추출 코드를 따른다.
     #   bb     llms/utils.py            lower().find(...)     -> 첫 번째
@@ -99,6 +100,7 @@ def main():
                 # thinking 이 꺼지지 않은 경우. assistant_text 가 CoT 가 아니라
                 # "사고 블록 + 결론"이 되므로 분절도 채점도 의미를 잃는다.
                 "think_leak": "<think>" in r["assistant_text"],
+
                 "n_paragraphs": len([s for s in _BLANK.split(reasoning) if s.strip()]),
                 "schema_echo": n_schema > 0,
                 **rep,
@@ -138,6 +140,7 @@ def main():
           f"   (stop_reason=max_tokens. 포맷 불이행과 구분해야 한다)")
     print(f"  think 누출     {frac('think_leak'):.1%}"
           f"   (<think> 가 assistant_text 에 남음)")
+
     print(f"  다중 경계      {np.mean([x['n_boundary_matches'] > 1 for x in rows]):.1%}"
           f"   (종결구 2회 이상)")
 
@@ -168,6 +171,7 @@ def main():
         v.append(f"FAIL <think> 누출 {frac('think_leak'):.1%} -> qwen.ENABLE_THINKING 이 "
                  "먹지 않았다. 추론이 thinking block 으로 빠지면 남는 것은 결론뿐이라 "
                  "CoT 분절 자체가 성립하지 않는다")
+
     if frac("truncated") > 0.0:
         v.append(f"FAIL 절단 {frac('truncated'):.1%} -> --max-new-tokens 상향. "
                  "절단분은 답 블록이 없으므로 no_answer 로 잘못 집계된다")

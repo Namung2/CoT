@@ -8,7 +8,7 @@
 
     Qwen chat template
       user      : messages[0]      (단일 user 메시지. prompt.build_messages 참조)
-      assistant : assistant_text   (= 모델이 낸 CoT + 답. prefill 없음)
+
 
     -> prompt_len 은 assistant 턴 시작 직전까지의 토큰 수.
        token_ids[prompt_len:] 을 디코드하면 assistant_text 와 같아야 한다.
@@ -46,9 +46,11 @@ from transformers import AutoTokenizer
 from .qwen import ENABLE_THINKING, MODEL as ENCODER_MODEL, render_prefix
 
 
+
 def encode_one(tok, rec: dict) -> dict:
     """한 레코드를 Qwen 토큰열로. (token_ids, prompt_len, 정합 리포트)"""
     prefix_text = render_prefix(tok, rec["messages"])
+
     full_text = prefix_text + rec["assistant_text"]
 
     prompt_ids = tok(prefix_text, add_special_tokens=False).input_ids
@@ -73,6 +75,7 @@ def encode_one(tok, rec: dict) -> dict:
         # thinking 이 꺼지지 않았으면 여기에 <think> 가 남는다. 그 경우 assistant_text
         # 는 CoT 가 아니라 "사고 블록 + 결론"이 되어 분절 전제가 깨진다.
         "think_leak": "<think>" in rec["assistant_text"],
+
         # 불일치일 때만 원문을 남긴다. 전부 남기면 파일이 두 배가 된다.
         "mismatch": None if exact else {
             "expected": rec["assistant_text"][:400],
@@ -112,6 +115,7 @@ def main():
               f"!= encoder={args.encoder!r}")
     m["encoder"] = {"model": args.encoder,
                     "enable_thinking": ENABLE_THINKING,
+
                     "transformers_version": __import__("transformers").__version__}
     man.write_text(json.dumps(m, ensure_ascii=False, indent=2))
 
@@ -124,6 +128,7 @@ def main():
     if leak:
         print(f"  think leak     {leak}/{n}   (<think> 가 assistant_text 에 남음 "
               f"-> qwen.ENABLE_THINKING 이 먹지 않았다)")
+
     print(f"  prompt_len     median {sorted(r['prompt_len'] for r in rows)[n//2]}")
     print(f"  assistant tok  median {nt[n//2]}  [{nt[0]}, {nt[-1]}]")
     for r in bad[:3]:
