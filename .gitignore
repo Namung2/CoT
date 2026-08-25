@@ -1,0 +1,6 @@
+.gitignore
+.claude/*
+__pycache__/
+*.log
+data/
+third_party/
