@@ -74,15 +74,17 @@ if ! $PY -c "import matplotlib" 2>/dev/null; then
     echo "  matplotlib 설치"
     $PY -m pip install --quiet matplotlib
 fi
-$PY visual/heatmap.py "${OUTS[@]}" --drift --growth
+$PY visual/heatmap.py "${OUTS[@]}" --drift --states --growth
 
 echo
 echo "완료. visual/ 아래를 보세요."
 echo "  .centered.png  토큰 x 토큰. 대각 블록이 밝고 비대각이 어두우면 스텝 안은"
 echo "                 가깝고 스텝 간은 멀다는 뜻. 단 'distance-matched gap' 을 보라"
 echo "                 — 그냥 gap 은 '같은 블록 토큰은 원래 붙어 있다' 에 속는다."
-echo "  .drift.png     시점 x 시점. 블록 경계(흰 선)에 가로/세로 줄이 서면 그 지점에서"
-echo "                 상태가 급변한 것 = 우리가 그은 분절이 실재한다는 뜻."
+echo "  .states.png    블록 끝 지점의 h 끼리. MDP 로 치면 상태 궤적이다. 인접 상태가"
+echo "                 닮고 먼 상태가 안 닮으면 궤적이 실제로 진행하는 것."
+echo "  .drift.png     시점 x 시점(누적). 포함 관계 때문에 0.99 로 포화하니 단독으로"
+echo "                 믿지 말고 .states.png 와 같이 볼 것."
 echo "  .growth.png    prefix 를 늘려가며 gap 이 어떻게 변하는지."
 echo
 echo "  raw 코사인으로 대조: python visual/heatmap.py ${OUTS[*]} --which cosine"
