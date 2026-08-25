@@ -56,22 +56,28 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pt", type=Path, nargs="+")
     ap.add_argument("--kind", choices=["step", "action", "both"], default="both")
-    ap.add_argument("--raw", action="store_true",
-                    help="코사인 대신 내적 S 를 그린다 (노름 차이에 지배됨)")
+    # 기본이 centered 인 이유: residual stream 의 공통 평균 방향 때문에 raw 코사인은
+    # 무엇이든 +0.4~0.6 으로 뭉쳐 나온다. 공통 성분을 뺀 쪽이 구조를 보여준다.
+    ap.add_argument("--which", choices=["centered", "cosine", "inner"],
+                    default="centered",
+                    help="centered=중심화 코사인(기본) / cosine=원본 코사인 / inner=내적")
     ap.add_argument("--dpi", type=int, default=140)
     args = ap.parse_args()
 
     for path in args.pt:
         z = torch.load(path, map_location="cpu", weights_only=False)
         meta = z["meta"]
-        M = (z["S"] if args.raw else z["C"]).numpy()
+        key = {"centered": "C_centered", "cosine": "C", "inner": "S"}[args.which]
+        if key not in z:      # --model 을 바꾸기 전에 만든 오래된 .pt
+            raise SystemExit(f"{path}: '{key}' 없음 — probe_gram.py 를 다시 돌리세요")
+        M = z[key].numpy()
         N = M.shape[0]
 
         kinds = ["step", "action"] if args.kind == "both" else [args.kind]
         blocks = {k: z["blocks"][k] for k in kinds}
 
         # 내적은 값 범위가 제각각이라 분위수로 자른다. 코사인은 [-1,1] 고정.
-        if args.raw:
+        if args.which == "inner":
             vmax = float(np.percentile(np.abs(M), 99)); vmin = -vmax
         else:
             vmin, vmax = -1.0, 1.0
@@ -81,10 +87,10 @@ def main():
         for ax, k in zip(axes[0], kinds):
             im = draw(ax, M, blocks[k], k, vmin, vmax)
         fig.suptitle(f"{meta['id']}   task={meta['task']}  success={meta['success']}   "
-                     f"N={N}  {'inner product' if args.raw else 'cosine'}")
+                     f"N={N}  {args.which}  {meta['model']}")
         fig.colorbar(im, ax=axes[0].tolist(), fraction=0.02)
 
-        out = path.with_suffix(".raw.png" if args.raw else ".png")
+        out = path.with_suffix(f".{args.which}.png")
         fig.savefig(out, dpi=args.dpi, bbox_inches="tight")
         plt.close(fig)
         print(f"saved {out}")

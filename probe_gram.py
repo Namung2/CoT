@@ -28,7 +28,10 @@ from pathlib import Path
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-MODEL = "Qwen/Qwen2.5-3B-Instruct"   # extract.py 와 같은 인코더
+# 읽는 모델은 쓴 모델과 같아야 한다 (자기생성). 다르면 "3B 가 32B 의 글을 읽으며
+# 만드는 표현"이 되어 32B 의 추론 상태와는 별개의 것을 보게 된다.
+# extract.py 는 아직 Qwen2.5-3B 로 하드코딩돼 있어 여기와 갈린다.
+DEFAULT_MODEL = "Qwen/Qwen3-32B"
 
 
 def load_episode(path: Path, index: int, ep_id: str | None):
@@ -68,6 +71,8 @@ def main():
     ap.add_argument("input", type=Path, help="segment.py 가 만든 jsonl")
     ap.add_argument("--index", type=int, default=0)
     ap.add_argument("--id", dest="ep_id", default=None, help="index 대신 id 로 지정")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"인코더. 기본 {DEFAULT_MODEL} (= CoT 를 쓴 모델)")
     ap.add_argument("--out", type=Path, default=None,
                     help="확장자 없는 저장 경로. 기본 visual/gram_<id>")
     args = ap.parse_args()
@@ -75,7 +80,7 @@ def main():
     ep = load_episode(args.input, args.index, args.ep_id)
     text = ep["all_llm_output"]
 
-    tok = AutoTokenizer.from_pretrained(MODEL)
+    tok = AutoTokenizer.from_pretrained(args.model)
     enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     ids, offs = enc.input_ids, enc.offset_mapping
     N = len(ids)
@@ -91,13 +96,22 @@ def main():
               " ".join(f"{n}[{s}:{e}]" for n, s, e in bs[:6]) +
               (" ..." if len(bs) > 6 else ""))
 
-    model = AutoModel.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="auto")
+    model = AutoModel.from_pretrained(args.model, dtype=torch.bfloat16, device_map="auto")
     model.eval()
     H = model(torch.tensor([ids], device=model.device)).last_hidden_state[0].float()
 
+    def cosine(X):
+        n = X.norm(dim=1)
+        return ((X @ X.T) / torch.outer(n, n)).clamp(-1, 1).cpu(), n.cpu()
+
     S = (H @ H.T).cpu()                      # 내적. 대각 = ‖h_i‖²
-    norm = H.norm(dim=1)
-    C = (S / torch.outer(norm, norm).cpu()).clamp(-1, 1)   # 코사인
+    C, norm = cosine(H)
+
+    # residual stream 은 모든 토큰이 공유하는 큰 평균 방향을 갖는다. 그대로 코사인을
+    # 재면 무엇이든 +0.4~0.6 이 나와 실제 구조가 공통 성분에 묻힌다 (3B 로 잰 첫 시도에서
+    # 대각-비대각 격차가 0.05 에 그쳤다). 토큰 평균을 빼고 다시 잰다.
+    Hc = H - H.mean(dim=0, keepdim=True)
+    Cc, norm_c = cosine(Hc)
 
     # id 에 success/fail 구분이 없다. 같은 seed 의 성공/실패를 둘 다 뽑으면
     # 파일명이 겹치므로 입력 파일 이름(success/fail)을 접두사로 붙인다.
@@ -107,7 +121,9 @@ def main():
     # 리스트라 npz 에 넣으려면 dtype=object 로 감싸고 allow_pickle 을 켜야 하는데,
     # 그러면 결국 pickle 이라 torch.save 와 안전성이 같으면서 코드만 번거로워진다.
     torch.save({
-        "S": S, "C": C, "norm": norm.cpu(),
+        "S": S, "C": C, "norm": norm,
+        # 중심화 코사인. 공통 성분을 뺀 것이라 보통 이쪽이 구조를 보여준다.
+        "C_centered": Cc, "norm_centered": norm_c,
         "tokens": tok.convert_ids_to_tokens(ids),
         # 토큰 인덱스 (name, tok_start, tok_end) — C[s:e, s:e] 로 바로 잘린다
         "blocks": blocks,
@@ -120,20 +136,21 @@ def main():
         "offsets": offs,
         # 그림 제목에 쓸 정보. 이 파일 하나만 넘기면 heatmap.py 가 다 그릴 수 있게.
         "meta": {"id": ep["id"], "task": ep["task"], "success": ep["success"],
-                 "model": MODEL, "src": str(args.input)},
+                 "model": args.model, "src": str(args.input)},
     }, f"{out}.pt")
     print(f"saved {out}.pt")
 
-    # 블록 평균 코사인 — 그림 없이도 대각/비대각 대비를 숫자로 본다
-    for kind, bs in blocks.items():
-        diag = [C[s:e, s:e].mean().item() for _, s, e in bs]
-        off = []
-        for i, (_, s1, e1) in enumerate(bs):
-            for _, s2, e2 in bs[i + 1:]:
-                off.append(C[s1:e1, s2:e2].mean().item())
-        import statistics as st
-        print(f"  {kind:6} 대각블록 평균 {st.mean(diag):+.3f}   "
-              f"비대각 평균 {st.mean(off) if off else float('nan'):+.3f}")
+    # 블록 평균 코사인 — 그림 없이도 대각/비대각 대비를 숫자로 본다.
+    # gap(대각-비대각)이 클수록 세그먼트가 실제 의미 단위라는 뜻이다.
+    import statistics as st
+    for label, M in (("raw", C), ("centered", Cc)):
+        for kind, bs in blocks.items():
+            diag = st.mean(M[s:e, s:e].mean().item() for _, s, e in bs)
+            off = [M[s1:e1, s2:e2].mean().item()
+                   for i, (_, s1, e1) in enumerate(bs)
+                   for _, s2, e2 in bs[i + 1:]]
+            o = st.mean(off) if off else float("nan")
+            print(f"  {label:8} {kind:6} diag {diag:+.4f}  off {o:+.4f}  gap {diag - o:+.4f}")
 
     print(f"\n그림: python visual/heatmap.py {out}.pt")
 
