@@ -1,0 +1,22 @@
+# Minigrid 는 여기에 없습니다.
+# submodule(third_party/Minigrid, commit 6e713af)로 버전이 고정돼 있으므로 따로 설치하세요:
+#     pip install -e third_party/Minigrid
+# PyPI 의 minigrid 를 설치하면 그 핀을 덮어써서 LLM-BabyBench 와 호환이 깨집니다.
+# gymnasium/pygame 은 위 명령이 의존성으로 함께 설치합니다.
+
+# --- hidden state 추출 (inference/) ---
+torch==2.11.0
+transformers==5.5.4
+accelerate
+numpy==2.4.3
+tqdm==4.67.3
+
+# --- LLM-BabyBench 데이터 생성 (third_party/llm-babybench) ---
+PyYAML==6.0.3
+datasets
+openai
+anthropic
+
+# --- 분석 / 시각화 ---
+matplotlib==3.10.8
+scikit-learn==1.8.0

@@ -1,0 +1,6 @@
+[submodule "third_party/llm-babybench"]
+	path = third_party/llm-babybench
+	url = https://github.com/choukrani/llm-babybench.git
+[submodule "third_party/Minigrid"]
+	path = third_party/Minigrid
+	url = https://github.com/Farama-Foundation/Minigrid.git
