@@ -157,10 +157,13 @@ def main():
         cand = seed_candidates(level, done)
 
         while have < target:
+            # 남은 개수보다 많이 뽑으면 target 을 초과한다. 스킵이 나면
+            # 다음 라운드에서 부족분만큼 다시 끌어오므로 정확히 target 에 수렴한다.
+            need = min(args.chunk, target - have)
             raw_batch = []
             for sd in cand:
                 raw_batch.append((level, sd))
-                if len(raw_batch) >= args.chunk:
+                if len(raw_batch) >= need:
                     break
                 if sd >= seed_cap:
                     break
