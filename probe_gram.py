@@ -121,6 +121,10 @@ def main():
     # 리스트라 npz 에 넣으려면 dtype=object 로 감싸고 allow_pickle 을 켜야 하는데,
     # 그러면 결국 pickle 이라 torch.save 와 안전성이 같으면서 코드만 번거로워진다.
     torch.save({
+        # hidden state 원본. N x d 라 몇 MB 밖에 안 되는데, 이게 있으면 중심화
+        # 기준을 바꾸거나(전체 평균 vs prefix 평균) 다른 지표를 재볼 때 모델을
+        # 다시 올리지 않아도 된다. S, C 는 여기서 파생될 뿐이다.
+        "H": H.to(torch.bfloat16).cpu(),
         "S": S, "C": C, "norm": norm,
         # 중심화 코사인. 공통 성분을 뺀 것이라 보통 이쪽이 구조를 보여준다.
         "C_centered": Cc, "norm_centered": norm_c,
