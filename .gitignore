@@ -1,19 +1,24 @@
+# secrets
+key.txt
+.env
+
+# python
 .venv/
-data/
 __pycache__/
 *.pyc
 .pytest_cache/
-wandb/
-*.tar.gz
-test/
-.gitignore
-analysis/
-view_epi.py
+
+# data & artifacts
+data/
 *.jsonl
 *.pt
-zip/
+*.npz
 *.csv
 *.png
-*.npz
-key.txt
 *.log
+*.tar.gz
+zip/
+wandb/
+
+# os
+.DS_Store

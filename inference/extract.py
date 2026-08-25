@@ -72,8 +72,8 @@ def build_babyai(episode: dict):
     }
     return steps, meta
 
-@torch.no_grad()
-def extract_full_sequence_pass(steps: list[str]):
+@torch.no_grad() 
+def extract_full_sequence_pass(steps: list[str]): # full-sequence로 1번 forward pass
     ensure_model()
     ids = [] # 토큰 id
     spans = [] # 각 step의 범위를 기록
@@ -94,7 +94,7 @@ def extract_full_sequence_pass(steps: list[str]):
     return E # 위와 같이 stpe 단위로 잘린 행렬을 T개 저장(T = 전체 step 수(missionm, terminal포함))
 
 @torch.no_grad()
-def extract_cumulative_prefix_passes(steps: list[str]):
+def extract_cumulative_prefix_passes(steps: list[str]): # prefix 누적해서 T번 forward pass
     ensure_model()
     ids = []      # 누적 토큰 id
     E = {}
