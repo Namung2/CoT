@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -43,6 +44,16 @@ from llms.utils import parser
 
 TASK = "decompose"
 FORMATTER, PROMPTER = "structured", "cot"
+
+
+class _EvalTimeout(Exception):
+    """evaluator.evaluate()가 시간 내 안 끝날 때. BabyAIBot.replan()의 서브골
+    push/pop 루프가 env.step() 없이 순환에 빠지면 예외 없이 영원히 안 끝나서
+    (실제로 BabyAI-Synth-v0 seed=3000에서 관측됨) 일반 try/except로는 못 잡는다."""
+
+
+def _eval_timeout_handler(signum, frame):
+    raise _EvalTimeout("evaluator.evaluate() timed out")
 
 
 def build_prompt(fmt, prompter, env_name: str, seed: int):
@@ -88,6 +99,11 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=16384)
     ap.add_argument("--tp", type=int, default=2, help="tensor parallel size")
     ap.add_argument("--sampling-seed", type=int, default=0, help="재현용")
+    ap.add_argument("--eval-timeout", type=int, default=10,
+                    help="evaluator.evaluate() 1건당 제한 시간(초). "
+                         "봇 리플랜 루프가 안 끝나는 시드를 건너뛰기 위함. "
+                         "정상 케이스는 BossLevel(가장 무거움)도 실측 max 0.5s 이내라 "
+                         "10s면 오탐 없이 충분한 마진")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -167,11 +183,18 @@ def main():
                 try:
                     # Decompose evaluator는 (env_name, seed)가 아니라 살아있는 env 객체를 받음
                     env = make_env(env_name, seed)
-                    ev = evaluator.evaluate(env, pred)
+                    signal.signal(signal.SIGALRM, _eval_timeout_handler)
+                    signal.alarm(args.eval_timeout)
+                    try:
+                        ev = evaluator.evaluate(env, pred)
+                    finally:
+                        signal.alarm(0)
                     env.close()
                     err = None
-                except Exception as e:              # 파싱 실패(빈 서브골/포맷 위반) 또는 봇 실행 예외
+                except Exception as e:              # 파싱 실패(빈 서브골/포맷 위반), 봇 실행 예외, eval 타임아웃
                     ev, err = None, f"{type(e).__name__}: {e}"
+                    if isinstance(e, _EvalTimeout):
+                        print(f"  eval timeout {env_name} seed={seed} (>{args.eval_timeout}s), skip")
                 f.write(json.dumps({
                     "env_name": env_name,
                     "env_seed": seed,
