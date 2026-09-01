@@ -1,11 +1,11 @@
-<<<<<<< HEAD
+
 .gitignore
 .claude/*
 __pycache__/
 *.log
 data/
 third_party/
-=======
+
 # secrets
 key.txt
 .env
@@ -30,4 +30,3 @@ wandb/
 
 # os
 .DS_Store
->>>>>>> 4e2ead2d4bba34781faf22df5ad2b11c78feb581
