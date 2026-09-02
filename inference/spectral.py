@@ -69,6 +69,8 @@ def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method:
     rel = Path(task) / level
     out_dir = out_root / rel / method / ctx_tag / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("chunk_*.pt"):   # hidden_states 청크 개수가 줄었을 때 낡은 파일 안 남게
+        old.unlink()
 
     n_episodes = 0
     for cf in tqdm(chunk_files, desc=f"{rel}/{method}/{tag}", unit="chunk"):
