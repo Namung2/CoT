@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,7 +8,12 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
+from segment import split_steps
+
 MODEL = "Qwen/Qwen2.5-3B-Instruct"
+MAX_TOKENS = 32768                       # 초과 시 skip (meta에 기록)
+HEAVY_FIELDS = ("prompt", "all_llm_output", "parsed_llm_output")
+
 tok = None
 model = None
 
@@ -24,31 +30,109 @@ def ensure_model():
     return tok, model
 
 
-def verify_spans(steps: list[str]):
+# ---------------------------------------------------------------- tokenization
+
+def tokenize_episode(episode: dict, use_prompt_context: bool):
+    """원문을 1회 토큰화하고 step 경계를 토큰 좌표로 사상.
+
+    반환:
+      ids        : forward에 넣을 전체 토큰 (prompt 포함 여부는 flag에 따름)
+      ctx        : output 시작 전 컨텍스트 토큰 수 (prompt 미사용 시 0)
+      boundaries : 길이 T+1, output 토큰 기준 step 경계.
+                   step t = E[boundaries[t]:boundaries[t+1]]
+    """
     ensure_model()
-    ids, spans = [], []
-    for j, step in enumerate(steps):
-        text = step if j == 0 else "\n" + step
-        s = len(ids)
-        ids.extend(tok(text, add_special_tokens=(j == 0)).input_ids)
-        spans.append((s, len(ids)))
+    output = episode["all_llm_output"]
+    steps = split_steps(output)
+    assert "".join(steps) == output      # segment.py 계약
 
-    assert spans[0][0] == 0 and spans[-1][1] == len(ids)
-    for (_, e), (s, _) in zip(spans, spans[1:]):
-        assert e == s, f"gap/overlap at {e} != {s}"
+    prompt = episode["prompt"] if use_prompt_context else ""
+    text = prompt + output
 
-    for t, (s, e) in enumerate(spans):
-        got = tok.decode(ids[s:e])
-        want = steps[t] if t == 0 else "\n" + steps[t]
-        print(f"t={t:2d} n_tok={e-s:3d} {'OK ' if got == want else 'MISMATCH'} {got!r}")
+    enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+    ids, offs = enc.input_ids, enc.offset_mapping
 
-def load_episodes(data_dir: Path, case: str, level: str, step: str):
-    target = data_dir / case / level / step
-    if not target.is_dir():
-        raise FileNotFoundError(f"no such directory: {target}")
-    
+    # char 경계(누적 길이) → token 경계. 토큰의 시작 문자가 속한 구간에 배정.
+    char_bounds = [len(prompt)]
+    for s in steps:
+        char_bounds.append(char_bounds[-1] + len(s))
+
+    tok_bounds, k = [], 0
+    for cb in char_bounds:
+        while k < len(ids) and offs[k][0] < cb:
+            k += 1
+        tok_bounds.append(k)
+    assert tok_bounds[-1] == len(ids), "unconsumed tokens"
+
+    ctx = tok_bounds[0]                              # prompt 토큰 수
+    boundaries = [b - ctx for b in tok_bounds]       # output 기준으로 shift
+    return ids, ctx, boundaries
+
+
+# ------------------------------------------------------------------ extractors
+
+@torch.no_grad()
+def extract_full_sequence(ids, ctx, boundaries):
+    """전체 1회 forward. output 구간만 저장 → E: (output 토큰수) x d."""
+    ensure_model()
+    H = model(torch.tensor([ids], device=model.device)).last_hidden_state[0]
+    return H[ctx:].to(torch.bfloat16).cpu().clone()
+
+
+@torch.no_grad()
+def extract_cumulative_prefix(ids, ctx, boundaries):
+    """step t마다 prefix(ids[:ctx+b_{t+1}])로 forward, 해당 step 구간만 누적.
+
+    full_sequence와 동일한 ids/boundaries를 쓰므로 토큰열이 완전히 일치.
+    반환 shape은 동일하게 (output 토큰수) x d이나, 행마다 forward된
+    prefix 길이가 다르다는 점은 분석 시 해석에 반영할 것.
+    """
+    ensure_model()
+    rows = []
+    for s, e in zip(boundaries, boundaries[1:]):
+        H = model(
+            torch.tensor([ids[: ctx + e]], device=model.device)
+        ).last_hidden_state[0]
+        rows.append(H[ctx + s : ctx + e].to(torch.bfloat16).cpu())
+    return torch.cat(rows, dim=0)
+
+
+EXTRACTORS = {
+    "full_sequence": extract_full_sequence,
+    "cumulative_prefix": extract_cumulative_prefix,
+}
+
+
+# ------------------------------------------------------------------------ meta
+
+def build_meta(episode: dict) -> dict:
+    """heavy 텍스트 필드만 빼고 전부 복사 (task별 확장 필드 자동 포함)."""
+    return {k: v for k, v in episode.items() if k not in HEAVY_FIELDS}
+
+
+def episode_status(episode: dict) -> str:
+    """성공/실패 → 저장 디렉토리 분기.
+
+    eval_result 포맷이 task마다 다름:
+      - {"success": bool, ...}  → success 그대로 사용
+      - {"CR": float, ...}      → CR == 1 을 성공으로 판정 (기준 바뀌면 여기 수정)
+    """
+    r = episode.get("eval_result") or {}
+    if "success" in r:
+        return "success" if r["success"] else "failure"
+    if "CR" in r:
+        return "success" if r["CR"] == 1 else "failure"
+    raise ValueError(f"cannot determine status from eval_result: {r!r}")
+
+
+# ------------------------------------------------------------------------- run
+
+def load_episodes(data_dir: Path):
+    data_dir = data_dir.resolve()
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"no such directory: {data_dir}")
     episodes = []
-    for path in sorted(target.glob("*.jsonl")):
+    for path in sorted(data_dir.rglob("*.jsonl")):
         with path.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -56,92 +140,85 @@ def load_episodes(data_dir: Path, case: str, level: str, step: str):
                     episodes.append((path, json.loads(line)))
     return episodes
 
-def build_babyai(episode: dict):
-    mission = f"Mission: {episode['mission'].strip()}" # "mission: 실제 mission text"로 저장
-    steps = [s.strip() for s in episode["steps"] if s.strip()] # "일련의 step들로 저장: [step1, step2, step3, ...]"
-    terminal = f"Terminal: {episode['terminal'].strip()}" # "terminal: 실제 terminal text"로 저장
 
-    steps = [mission] + steps + [terminal] # mission, sptes, terminal을 list로 합쳐서 저장. 
-
-    meta = {
-        "id": episode["id"],
-        "level": episode["level"],
-        "success": episode["answer"]["success"],
-        "action_seq": episode["answer"]["action_seq"],
-        "n_steps": len(steps),
-    }
-    return steps, meta
-
-@torch.no_grad() 
-def extract_full_sequence_pass(steps: list[str]): # full-sequence로 1번 forward pass
-    ensure_model()
-    ids = [] # 토큰 id
-    spans = [] # 각 step의 범위를 기록
-    
-    for j, step in enumerate(steps): # full sequence 생성 및 step 위치 계산
-        text = step if j == 0 else "\n" + step # mission(input quesition)을 제외하고 나머지는 모두 앞에 \n을 삽입
-        s = len(ids)
-        ids.extend(tok(text, add_special_tokens=(j == 0)).input_ids) # step별로 따로 토큰화
-        spans.append((s, len(ids))) # 토큰화된 step의 좌표를 기록, 다시 step별로 잘라내기 위함
-    
-    out = model(torch.tensor([ids], device=model.device)) # forward
-    H = out.last_hidden_state[0].to(torch.bfloat16).cpu()
-    # H는 아직 step 별로 나눠지지 않은 하나의 시퀀스, H = N x d, (N = 전체 토큰수, d = model의 hidden 차원)
-
-    E = {}
-    for t, (s, e) in enumerate(spans): # mission을 포함(mission = step0)
-        E[t] = H[s:e].clone()  # H를 step 단위로 잘라서 저장, E = n_t x d (n_t는 step t에서의 토큰 수)
-    return E # 위와 같이 stpe 단위로 잘린 행렬을 T개 저장(T = 전체 step 수(missionm, terminal포함))
-
-@torch.no_grad()
-def extract_cumulative_prefix_passes(steps: list[str]): # prefix 누적해서 T번 forward pass
-    ensure_model()
-    ids = []      # 누적 토큰 id
-    E = {}
-
-    for t, step in enumerate(steps):
-        text = step if t == 0 else "\n" + step
-        s = len(ids)                                        # x_t 시작 위치
-        ids.extend(tok(text, add_special_tokens=(t == 0)).input_ids)
-        e = len(ids)                                        # N_t
-
-        H = model(torch.tensor([ids], device=model.device)).last_hidden_state[0]   # N_t x d
-
-        E[t] = H[s:e].to(torch.bfloat16).cpu()   # 마지막 step만
-
-    return E
-
-EXTRACTORS = {
-    "full_sequence": extract_full_sequence_pass,
-    "cumulative_prefix": extract_cumulative_prefix_passes,
-}
-
-def extract_run(data_root: Path, out_root: Path, case: str, level: str, step: str, method: str):
-
+def extract_run(
+    data_dir: Path,
+    out_root: Path,
+    method: str,
+    use_prompt_context: bool = True,
+):
     if method not in EXTRACTORS:
         raise ValueError(f"unknown method: {method!r} (choose from {list(EXTRACTORS)})")
     extractor = EXTRACTORS[method]
 
-    data_root = data_root.resolve()
-    episodes = load_episodes(data_dir = data_root, case=case, level=level, step=step)
+    episodes = load_episodes(data_dir)
 
-    rel = Path(case) / level / step
-    out_dir = out_root / rel / method
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ctx_tag = "with_prompt" if use_prompt_context else "no_prompt"
+    run_dir = out_root / method / ctx_tag
+    for status in ("success", "failure"):
+        (run_dir / status).mkdir(parents=True, exist_ok=True)
+    meta_path = run_dir / "meta.jsonl"
 
-    meta_path = out_root / rel / "meta.jsonl"
-
+    n_saved = n_skipped = 0
     with meta_path.open("w", encoding="utf-8") as mf:
         for path, episode in tqdm(episodes, desc="episodes", unit="episode"):
-            steps, meta = build_babyai(episode)
-            E = extractor(steps)
+            meta = build_meta(episode)
+            meta["src"] = path.name
+            status = episode_status(episode)
+            meta["status"] = status
 
-            out_path = out_dir / f"{meta['id']}.pt"
+            if episode.get("skipped"):               # 출력 자체가 없는 에피소드
+                meta["extract_skipped"] = "no_output"
+                mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                n_skipped += 1
+                continue
+
+            ids, ctx, boundaries = tokenize_episode(episode, use_prompt_context)
+            meta.update(
+                n_tokens_total=len(ids),
+                n_tokens_output=boundaries[-1],
+                n_steps=len(boundaries) - 1,
+                output_sha1=hashlib.sha1(
+                    episode["all_llm_output"].encode()
+                ).hexdigest(),
+            )
+
+            if len(ids) > MAX_TOKENS:
+                meta["extract_skipped"] = "too_long"
+                mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                n_skipped += 1
+                continue
+
+            E = extractor(ids, ctx, boundaries)
+            assert E.shape[0] == boundaries[-1]
+
+            out_path = run_dir / status / f"{episode['task']}_{episode['env_seed']}.pt"
             if out_path.exists():
                 raise FileExistsError(f"id collision: {out_path}")
-            torch.save({"E": E, "method": method, "model": MODEL}, out_path)
-
-            meta["src"] = path.name
+            torch.save(
+                {
+                    "E": E,                          # (output 토큰수) x d
+                    "boundaries": boundaries,        # 길이 T+1, output 토큰 기준
+                    "output_sha1": meta["output_sha1"],
+                    "method": method,
+                    "use_prompt_context": use_prompt_context,
+                    "model": MODEL,
+                },
+                out_path,
+            )
             mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+            n_saved += 1
 
-    print(f"saved {len(episodes)} episodes under {out_dir}")
+    print(f"saved {n_saved} episodes under {run_dir} ({n_skipped} skipped)")
+
+
+# ----------------------------------------------------------------- load helper
+
+def load_step_views(pt_path: Path) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """저장된 N x d 행렬과, boundaries로 자른 step별 view 리스트를 반환.
+
+    view라서 복사 비용 없음. E_t = views[t] (n_t x d).
+    """
+    blob = torch.load(pt_path)
+    E, b = blob["E"], blob["boundaries"]
+    return E, [E[s:e] for s, e in zip(b, b[1:])]
