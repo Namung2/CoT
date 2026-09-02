@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from extract import MODEL, load_step_views
+from extract import MODEL, load_chunk, load_step_views
 
 K_EIG = 8
 SCALE = True      # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
@@ -52,9 +52,9 @@ def load_hidden_states(data_dir: Path, task: str, level: str, method: str,
     if not target.is_dir():
         raise FileNotFoundError(f"no such directory: {target}")
 
-    files = sorted(target.glob("*.pt"))
+    files = sorted(target.glob("chunk_*.pt"))
     if not files:
-        raise FileNotFoundError(f"no .pt in {target}")
+        raise FileNotFoundError(f"no chunk_*.pt in {target}")
     return files
 
 @torch.no_grad()
@@ -63,20 +63,25 @@ def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method:
                  ctx_tag: str = "with_prompt"):
 
     data_root = data_root.resolve()
-    files = load_hidden_states(data_root, task, level, method, status, ctx_tag)
+    chunk_files = load_hidden_states(data_root, task, level, method, status, ctx_tag)
 
     tag = f"k{k}" + ("_scaled" if scale else "") + ("_signfix" if fix_sign else "")
     rel = Path(task) / level
     out_dir = out_root / rel / method / ctx_tag / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for f in tqdm(files, desc=f"{rel}/{method}/{tag}", unit="ep"):
-        _, views = load_step_views(f)
-        e, lam, V = episode_embeddings(views, k, scale, fix_sign)
+    n_episodes = 0
+    for cf in tqdm(chunk_files, desc=f"{rel}/{method}/{tag}", unit="chunk"):
+        chunk = load_chunk(cf)
+        out = {}
+        for seed, episode in chunk.items():
+            _, views = load_step_views(episode)
+            e, lam, V = episode_embeddings(views, k, scale, fix_sign)
+            out[seed] = {"e": e, "eigvals": lam, "V": V}
+            n_episodes += 1
 
-        out_path = out_dir / f.name
         torch.save({"k": k, "scale": scale, "fix_sign": fix_sign,
-                    "src": str(f), "model": MODEL,
-                    "e": e, "eigvals": lam, "V": V}, out_path)
+                    "src": str(cf), "model": MODEL, "episodes": out},
+                   out_dir / cf.name)
 
-    print(f"saved {len(files)} files under {out_dir}")
+    print(f"saved {n_episodes} episodes ({len(chunk_files)} chunks) under {out_dir}")

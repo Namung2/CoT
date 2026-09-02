@@ -151,7 +151,12 @@ def extract_run(
     level: str,
     method: str,
     use_prompt_context: bool = True,
+    chunk: int = 256,
 ):
+    """episode마다 파일 하나 대신, chunk개씩 묶어 run_dir/<status>/chunk_NNNN.pt 로
+    저장한다 (episode당 파일이면 레벨 하나에 최대 3만 개 생겨 inode/리스팅에 부담).
+    meta.jsonl 각 줄에 env_seed/status/chunk를 남겨서, 특정 episode가 어느 파일의
+    어느 키에 들었는지 스캔 없이 바로 찾을 수 있게 한다."""
     if method not in EXTRACTORS:
         raise ValueError(f"unknown method: {method!r} (choose from {list(EXTRACTORS)})")
     extractor = EXTRACTORS[method]
@@ -166,8 +171,24 @@ def extract_run(
     ctx_tag = "with_prompt" if use_prompt_context else "no_prompt"
     run_dir = out_root / task / level / method / ctx_tag
     for status in ("success", "failure"):
-        (run_dir / status).mkdir(parents=True, exist_ok=True)
+        d = run_dir / status
+        d.mkdir(parents=True, exist_ok=True)
+        for old in d.glob("chunk_*.pt"):   # 재실행 시 이전 청크 개수와 안 맞게 남는 것 방지
+            old.unlink()
     meta_path = run_dir / "meta.jsonl"
+
+    buffers = {"success": {}, "failure": {}}
+    chunk_idx = {"success": 0, "failure": 0}
+    seen_seeds = {"success": set(), "failure": set()}
+
+    def flush(status):
+        if not buffers[status]:
+            return
+        out_path = run_dir / status / f"chunk_{chunk_idx[status]:04d}.pt"
+        torch.save({"episodes": buffers[status], "method": method,
+                    "use_prompt_context": use_prompt_context, "model": MODEL}, out_path)
+        buffers[status] = {}
+        chunk_idx[status] += 1
 
     n_saved = n_skipped = 0
     with meta_path.open("w", encoding="utf-8") as mf:
@@ -203,33 +224,39 @@ def extract_run(
             E = extractor(ids, ctx, boundaries)
             assert E.shape[0] == boundaries[-1]
 
-            out_path = run_dir / status / f"{episode['task']}_{episode['env_name']}_{episode['env_seed']}.pt"
-            if out_path.exists():
-                raise FileExistsError(f"id collision: {out_path}")
-            torch.save(
-                {
-                    "E": E,                          # (output 토큰수) x d
-                    "boundaries": boundaries,        # 길이 T+1, output 토큰 기준
-                    "output_sha1": meta["output_sha1"],
-                    "method": method,
-                    "use_prompt_context": use_prompt_context,
-                    "model": MODEL,
-                },
-                out_path,
-            )
+            seed = episode["env_seed"]
+            if seed in seen_seeds[status]:
+                raise ValueError(f"id collision: {task}/{level}/{status} seed={seed}")
+            seen_seeds[status].add(seed)
+            buffers[status][seed] = {
+                "E": E,                          # (output 토큰수) x d
+                "boundaries": boundaries,        # 길이 T+1, output 토큰 기준
+                "output_sha1": meta["output_sha1"],
+            }
+            meta["chunk"] = chunk_idx[status]        # 이 episode가 들어갈 청크 파일 인덱스
             mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
             n_saved += 1
+
+            if len(buffers[status]) >= chunk:
+                flush(status)
+
+    for status in buffers:
+        flush(status)
 
     print(f"saved {n_saved} episodes under {run_dir} ({n_skipped} skipped)")
 
 
 # ----------------------------------------------------------------- load helper
 
-def load_step_views(pt_path: Path) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """저장된 N x d 행렬과, boundaries로 자른 step별 view 리스트를 반환.
+def load_chunk(pt_path: Path) -> dict:
+    """청크 파일 하나 로드. {env_seed: {"E":..., "boundaries":..., ...}, ...} 반환."""
+    return torch.load(pt_path, map_location="cpu", weights_only=False)["episodes"]
+
+
+def load_step_views(episode: dict) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """episode dict({"E","boundaries"})에서 N x d 행렬과 step별 view 리스트를 반환.
 
     view라서 복사 비용 없음. E_t = views[t] (n_t x d).
     """
-    blob = torch.load(pt_path)
-    E, b = blob["E"], blob["boundaries"]
+    E, b = episode["E"], episode["boundaries"]
     return E, [E[s:e] for s, e in zip(b, b[1:])]

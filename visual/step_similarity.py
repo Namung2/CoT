@@ -22,9 +22,9 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_hidden(pt_path: Path):
-    blob = torch.load(pt_path, map_location="cpu", weights_only=False)
-    return blob["E"], blob["boundaries"]
+def load_chunk(pt_path: Path) -> dict:
+    """청크 파일 하나 로드. {env_seed: {"E":..., "boundaries":..., ...}, ...} 반환."""
+    return torch.load(pt_path, map_location="cpu", weights_only=False)["episodes"]
 
 
 def intra_step_similarity(E: torch.Tensor, boundaries: list[int]) -> dict[int, float]:
@@ -62,37 +62,47 @@ def run(hidden_dir: Path, spectral_dir: Path, task: str, level: str, status: str
         spectral_tag: str = "k8_scaled_signfix"):
     h_dir = hidden_dir / task / level / method / ctx_tag / status
     s_dir = spectral_dir / task / level / method / ctx_tag / status / spectral_tag
-    files = sorted(h_dir.glob("*.pt"))
-    if not files:
-        raise FileNotFoundError(f"no .pt in {h_dir}")
+    chunk_files = sorted(h_dir.glob("chunk_*.pt"))
+    if not chunk_files:
+        raise FileNotFoundError(f"no chunk_*.pt in {h_dir}")
 
     intra_all: list[float] = []
     inter_last: dict[int, list[float]] = {}
     inter_e: dict[int, list[float]] = {}
+    n_episodes = 0
     n_no_spectral = 0
 
-    for f in files:
-        E, boundaries = load_hidden(f)
+    for cf in chunk_files:
+        hidden_episodes = load_chunk(cf)
 
-        for v in intra_step_similarity(E, boundaries).values():
-            intra_all.append(v)
+        spectral_f = s_dir / cf.name
+        spectral_episodes = {}
+        if spectral_f.exists():
+            spectral_episodes = torch.load(
+                spectral_f, map_location="cpu", weights_only=False)["episodes"]
 
-        for d, sims in inter_step_similarity(last_token_reps(E, boundaries)).items():
-            inter_last.setdefault(d, []).extend(sims)
+        for seed, ep in hidden_episodes.items():
+            n_episodes += 1
+            E, boundaries = ep["E"], ep["boundaries"]
 
-        spectral_f = s_dir / f.name
-        if not spectral_f.exists():
-            n_no_spectral += 1
-            continue
-        e_reps = torch.load(spectral_f, map_location="cpu", weights_only=False)["e"]
-        for d, sims in inter_step_similarity(e_reps).items():
-            inter_e.setdefault(d, []).extend(sims)
+            for v in intra_step_similarity(E, boundaries).values():
+                intra_all.append(v)
+
+            for d, sims in inter_step_similarity(last_token_reps(E, boundaries)).items():
+                inter_last.setdefault(d, []).extend(sims)
+
+            if seed not in spectral_episodes:
+                n_no_spectral += 1
+                continue
+            e_reps = spectral_episodes[seed]["e"]
+            for d, sims in inter_step_similarity(e_reps).items():
+                inter_e.setdefault(d, []).extend(sims)
 
     def summarize(vals: list[float]) -> dict:
         return {"mean": statistics.mean(vals), "std": statistics.pstdev(vals), "n": len(vals)}
 
     summary = {
-        "task": task, "level": level, "status": status, "n_episodes": len(files),
+        "task": task, "level": level, "status": status, "n_episodes": n_episodes,
         "n_episodes_missing_spectral": n_no_spectral,
         "intra_step": summarize(intra_all),
         "inter_step_last_token": {d: summarize(v) for d, v in sorted(inter_last.items())},
