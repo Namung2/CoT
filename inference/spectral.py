@@ -24,9 +24,8 @@ def spectral_embedding(Et: torch.Tensor, k: int, scale: bool, fix_sign: bool):
     r = min(k, S.shape[0])                                 # rank(G_t) ≤ n_t
     S_k, V_k = S[:r], Vh[:r]                               # 내림차순 보장됨
 
-    if fix_sign:  # q와 -q 모호성 제거: 최대 절댓값 성분을 양수로
-        idx = V_k.abs().argmax(dim=1)
-        sign = torch.sign(V_k.gather(1, idx[:, None]))
+    if fix_sign:  # q와 -q 모호성 제거: 첫 번째 성분을 양수로 통일
+        sign = torch.sign(V_k[:, :1])
         sign[sign == 0] = 1.0
         V_k = V_k * sign
 
