@@ -5,6 +5,8 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+from extract import MODEL, load_step_views
+
 K_EIG = 8
 SCALE = True      # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
 FIX_SIGN = True   # 고유벡터 부호 고정
@@ -39,14 +41,15 @@ def spectral_embedding(Et: torch.Tensor, k: int, scale: bool, fix_sign: bool):
 
 
 @torch.no_grad()
-def episode_embeddings(E: dict[int, torch.Tensor], k: int, scale: bool, fix_sign: bool):
+def episode_embeddings(views: list[torch.Tensor], k: int, scale: bool, fix_sign: bool):
     e, lam, V = {}, {}, {}
-    for t in sorted(E):
-        e[t], lam[t], V[t] = spectral_embedding(E[t].to(DEVICE), k, scale, fix_sign)
+    for t, Et in enumerate(views):
+        e[t], lam[t], V[t] = spectral_embedding(Et.to(DEVICE), k, scale, fix_sign)
     return e, lam, V
 
-def load_hidden_states(data_dir: Path, case: str, level: str, step: str, method: str):
-    target = data_dir / case / level / step / method
+def load_hidden_states(data_dir: Path, task: str, level: str, method: str,
+                       status: str, ctx_tag: str = "with_prompt"):
+    target = data_dir / task / level / method / ctx_tag / status
     if not target.is_dir():
         raise FileNotFoundError(f"no such directory: {target}")
 
@@ -56,24 +59,25 @@ def load_hidden_states(data_dir: Path, case: str, level: str, step: str, method:
     return files
 
 @torch.no_grad()
-def spectral_run(data_root: Path, out_root: Path, case: str, level: str, step: str, method: str,
-                 k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN):
+def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method: str,
+                 status: str, k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN,
+                 ctx_tag: str = "with_prompt"):
 
     data_root = data_root.resolve()
-    files = load_hidden_states(data_root, case, level, step, method)
+    files = load_hidden_states(data_root, task, level, method, status, ctx_tag)
 
     tag = f"k{k}" + ("_scaled" if scale else "") + ("_signfix" if fix_sign else "")
-    rel = Path(case) / level / step
-    out_dir = out_root / rel / method / tag
+    rel = Path(task) / level
+    out_dir = out_root / rel / method / ctx_tag / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for f in tqdm(files, desc=f"{rel}/{method}/{tag}", unit="ep"):
-        data = torch.load(f, map_location="cpu", weights_only=False)
-        e, lam, V = episode_embeddings(data["E"], k, scale, fix_sign)
+        _, views = load_step_views(f)
+        e, lam, V = episode_embeddings(views, k, scale, fix_sign)
 
         out_path = out_dir / f.name
         torch.save({"k": k, "scale": scale, "fix_sign": fix_sign,
-                    "src": str(f), "model": data["model"],
+                    "src": str(f), "model": MODEL,
                     "e": e, "eigvals": lam, "V": V}, out_path)
 
     print(f"saved {len(files)} files under {out_dir}")

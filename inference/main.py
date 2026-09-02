@@ -12,14 +12,17 @@ def parse_args():
     p = argparse.ArgumentParser(description="CoT hidden state extraction + spectral embedding")
 
     # 데이터 선택
-    p.add_argument("--case", required=True, help="e.g. c3")
-    p.add_argument("--level", required=True, help="e.g. gotoseq")
-    p.add_argument("--step", required=True, help="e.g. step10")
+    p.add_argument("--task", required=True, choices=["decompose", "plan", "predict"])
+    p.add_argument("--level", required=True,
+                   help="env_name 그대로. 예: BabyAI-GoToObj-v0, "
+                        "CustomBabyAI-GoToRedBall-Small-4Dists-v0")
+    p.add_argument("--status", default="success", choices=["success", "failure"],
+                   help="spectral 단계에서 읽을 대상 (extract는 항상 둘 다 저장)")
     p.add_argument("--methods", nargs="+", default=["full_sequence"],
                    choices=list(EXTRACTORS))
 
     # 경로
-    p.add_argument("--data-dir", type=Path, default=ROOT / "observed" / "reasoning_trajectory" / "success")
+    p.add_argument("--data-dir", type=Path, default=ROOT / "data")
     p.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     p.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
 
@@ -45,8 +48,8 @@ def main():
 
     for method in a.methods:
         if a.extract:
-            extract_run(data_root=a.data_dir, out_root=a.hidden_dir,
-                        case=a.case, level=a.level, step=a.step, method=method)
+            extract_run(data_dir=a.data_dir, out_root=a.hidden_dir,
+                        task=a.task, level=a.level, method=method)
 
         if not a.spectral:
             continue
@@ -55,8 +58,8 @@ def main():
             for scale in a.scale:
                 for fix_sign in a.fix_sign:
                     spectral_run(data_root=a.hidden_dir, out_root=a.spectral_dir,
-                                 case=a.case, level=a.level, step=a.step, method=method,
-                                 k=k, scale=scale, fix_sign=fix_sign)
+                                 task=a.task, level=a.level, method=method,
+                                 status=a.status, k=k, scale=scale, fix_sign=fix_sign)
 
 
 if __name__ == "__main__":

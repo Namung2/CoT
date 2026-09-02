@@ -143,6 +143,8 @@ def load_episodes(data_dir: Path):
 def extract_run(
     data_dir: Path,
     out_root: Path,
+    task: str,
+    level: str,
     method: str,
     use_prompt_context: bool = True,
 ):
@@ -150,10 +152,15 @@ def extract_run(
         raise ValueError(f"unknown method: {method!r} (choose from {list(EXTRACTORS)})")
     extractor = EXTRACTORS[method]
 
-    episodes = load_episodes(data_dir)
+    all_episodes = load_episodes(data_dir)
+    episodes = [(p, e) for p, e in all_episodes
+               if e.get("task") == task and e.get("env_name") == level]
+    if not episodes:
+        raise ValueError(f"no episodes with task == {task!r} and env_name == {level!r} "
+                         f"under {data_dir} ({len(all_episodes)} loaded total)")
 
     ctx_tag = "with_prompt" if use_prompt_context else "no_prompt"
-    run_dir = out_root / method / ctx_tag
+    run_dir = out_root / task / level / method / ctx_tag
     for status in ("success", "failure"):
         (run_dir / status).mkdir(parents=True, exist_ok=True)
     meta_path = run_dir / "meta.jsonl"
@@ -163,14 +170,15 @@ def extract_run(
         for path, episode in tqdm(episodes, desc="episodes", unit="episode"):
             meta = build_meta(episode)
             meta["src"] = path.name
-            status = episode_status(episode)
-            meta["status"] = status
 
             if episode.get("skipped"):               # 출력 자체가 없는 에피소드
                 meta["extract_skipped"] = "no_output"
                 mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
                 n_skipped += 1
                 continue
+
+            status = episode_status(episode)
+            meta["status"] = status
 
             ids, ctx, boundaries = tokenize_episode(episode, use_prompt_context)
             meta.update(
@@ -191,7 +199,7 @@ def extract_run(
             E = extractor(ids, ctx, boundaries)
             assert E.shape[0] == boundaries[-1]
 
-            out_path = run_dir / status / f"{episode['task']}_{episode['env_seed']}.pt"
+            out_path = run_dir / status / f"{episode['task']}_{episode['env_name']}_{episode['env_seed']}.pt"
             if out_path.exists():
                 raise FileExistsError(f"id collision: {out_path}")
             torch.save(
