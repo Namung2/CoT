@@ -23,3 +23,6 @@ wandb/
 # os
 .DS_Store
 *.md
+*.out
+.claude/
+.gitignore
