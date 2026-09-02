@@ -9,8 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from segment import split_steps
-
-MODEL = "Qwen/Qwen2.5-3B-Instruct"
+MODEL = "Qwen/Qwen3-32B"
 MAX_TOKENS = 32768                       # 초과 시 skip (meta에 기록)
 HEAVY_FIELDS = ("prompt", "all_llm_output", "parsed_llm_output")
 
@@ -33,7 +32,7 @@ def ensure_model():
 # ---------------------------------------------------------------- tokenization
 
 def tokenize_episode(episode: dict, use_prompt_context: bool):
-    """원문을 1회 토큰화하고 step 경계를 토큰 좌표로 사상.
+    """원문을 1회 토큰화하고 step 경계를 토큰 좌표로 매핑.
 
     반환:
       ids        : forward에 넣을 전체 토큰 (prompt 포함 여부는 flag에 따름)
@@ -44,7 +43,7 @@ def tokenize_episode(episode: dict, use_prompt_context: bool):
     ensure_model()
     output = episode["all_llm_output"]
     steps = split_steps(output)
-    assert "".join(steps) == output      # segment.py 계약
+    assert "".join(steps) == output
 
     prompt = episode["prompt"] if use_prompt_context else ""
     text = prompt + output

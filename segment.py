@@ -6,12 +6,7 @@ STEP_PAT = re.compile(r"(?mi)^(?:#+\s*|\*+\s*)?Step\s*(\d+)\s*[.:]")
 
 
 def split_steps(text: str) -> list[str]:
-    """all_llm_output을 step 단위로 분할.
-
-    계약: "".join(반환값) == text (strip 없음, 원문 보존).
-    Step 1 헤더 앞에 서두가 있으면 그게 step0, 없으면 Step 1이 첫 원소.
-    헤더가 하나도 없으면 통째로 원소 하나.
-    """
+    
     if not text.strip():
         return []
 
