@@ -115,12 +115,16 @@ def episode_status(episode: dict) -> str:
     eval_result 포맷이 task마다 다름:
       - {"success": bool, ...}  → success 그대로 사용
       - {"CR": float, ...}      → CR == 1 을 성공으로 판정 (기준 바뀌면 여기 수정)
+      - 비어있음(None/{})       → eval 자체가 실패(파싱 실패/봇 예외/타임아웃,
+                                   eval_error에 기록됨) → failure로 분류
     """
     r = episode.get("eval_result") or {}
     if "success" in r:
         return "success" if r["success"] else "failure"
     if "CR" in r:
         return "success" if r["CR"] == 1 else "failure"
+    if episode.get("eval_error") is not None:
+        return "failure"
     raise ValueError(f"cannot determine status from eval_result: {r!r}")
 
 
