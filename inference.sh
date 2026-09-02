@@ -8,10 +8,20 @@
 # (모델 forward를 두 번 안 하기 위함).
 #
 # 사용:
-#   tmux new -s inference
-#   ./inference.sh
+#   ./inference.sh          # 백그라운드로 떨어지고 바로 셸로 돌아옴 (터미널/ssh 끊겨도 계속 돎)
+#   tail -f nohup_*.out     # 진행 상황 보기
+#   kill <pid>              # 중단하고 싶으면 (시작할 때 찍히는 pid)
 set -uo pipefail
 cd "$(dirname "$0")"
+
+# 스스로를 nohup+setsid로 재실행해서 백그라운드로 떨어뜨린다. 이미 백그라운드로
+# 재실행된 상태(INFERENCE_SH_BG=1)면 이 블록은 건너뛰고 바로 본 작업으로 간다.
+if [[ "${INFERENCE_SH_BG:-}" != "1" ]]; then
+    nohup_log="nohup_$(date +%Y%m%d_%H%M%S).out"
+    INFERENCE_SH_BG=1 nohup setsid "$0" "$@" > "$nohup_log" 2>&1 &
+    echo "started in background: pid=$! log=$nohup_log"
+    exit 0
+fi
 
 export CUDA_VISIBLE_DEVICES=0                      # Qwen3-32B라 GPU 여러 개 필요하면 수정
 
