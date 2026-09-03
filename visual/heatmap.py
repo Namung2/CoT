@@ -23,8 +23,8 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
-from extract import load_chunk                                    # noqa: E402
-from spectral import spectral_embedding, K_EIG, SCALE, FIX_SIGN   # noqa: E402
+from extract import load_chunk                                          # noqa: E402
+from spectral import spectral_embedding, DEVICE, K_EIG, SCALE, FIX_SIGN  # noqa: E402
 
 
 @torch.no_grad()
@@ -38,7 +38,7 @@ def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
     e_list, last_of_step = [], {}
     for t, (s, e) in enumerate(zip(boundaries, boundaries[1:])):
         for i in range(s, e):
-            e_i, _, _ = spectral_embedding(E[s:i + 1], k, scale, fix_sign)
+            e_i, _, _ = spectral_embedding(E[s:i + 1].to(DEVICE), k, scale, fix_sign)
             e_list.append(e_i)
         last_of_step[t] = e_list[-1] if e > s else None
     return torch.stack(e_list), last_of_step
