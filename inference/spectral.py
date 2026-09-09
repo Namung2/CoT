@@ -8,43 +8,84 @@ from tqdm import tqdm
 from extract import MODEL, load_chunk, load_step_views
 
 K_EIG = 8
-SCALE = True      # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
-FIX_SIGN = True   # 고유벡터 부호 고정
+SCALE = True        # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
+SIGN_MODE = "data"  # "none" | "first" | "max" | "data"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _fix_sign(V_k: torch.Tensor, Et: torch.Tensor, mode: str):
+    """고유벡터 부호 보정. V_k: (r, d), Et: (n, d).
+
+    - "none":  보정 안 함
+    - "first": 각 벡터의 첫 성분이 양수가 되도록 (기존 방식)
+    - "max":   각 벡터의 최대 절댓값 성분이 양수가 되도록
+    - "data":  Bro, Acar & Kolda (2007)의 부호-가중 내적 점수
+               s_k = Σ_i sign(v_k·x_i)(v_k·x_i)²  (x_i = Et의 i번째 행)
+               가 양수가 되도록. 대칭(Gram) 케이스 단순화 버전.
+
+    반환: (부호 보정된 V_k, score 또는 None)
+    "data" 모드의 score는 (r,) — |score|/λ ∈ [0,1]이 부호 신뢰도 지표.
+    """
+    if mode == "none":
+        return V_k, None
+
+    if mode == "first":
+        sign = torch.sign(V_k[:, :1])                     # (r, 1)
+        sign[sign == 0] = 1.0
+        return V_k * sign, None
+
+    if mode == "max":
+        idx = V_k.abs().argmax(dim=1)                     # (r,)
+        vals = V_k.gather(1, idx[:, None])                # (r, 1)
+        sign = torch.sign(vals)
+        sign[sign == 0] = 1.0
+        return V_k * sign, None
+
+    if mode == "data":
+        proj = Et @ V_k.T                                 # (n, r): v_k·x_i
+        score = (torch.sign(proj) * proj**2).sum(dim=0)   # (r,)
+        sign = torch.sign(score)
+        sign[sign == 0] = 1.0                             # 완전 대칭이면 그대로 둠
+        return V_k * sign[:, None], score
+
+    raise ValueError(f"unknown sign_mode: {mode!r}")
+
+
 @torch.no_grad()
-def spectral_embedding(Et: torch.Tensor, k: int, scale: bool, fix_sign: bool):
+def spectral_embedding(Et: torch.Tensor, k: int, scale: bool, sign_mode: str):
     Et = Et.float()  # torch.linalg.svd는 bf16 미지원
 
     if scale:
-        Et = Et / (Et.shape[0] ** 0.5)  # Et.shape[0] = n_t
+        Et = Et / (Et.shape[0] ** 0.5)  # Et.shape[0] = n_t (부호에는 영향 없음)
 
     _, S, Vh = torch.linalg.svd(Et, full_matrices=False)   # S:(r,), Vh:(r,d)
     r = min(k, S.shape[0])                                 # rank(G_t) ≤ n_t
     S_k, V_k = S[:r], Vh[:r]                               # 내림차순 보장됨
 
-    if fix_sign:  # q와 -q 모호성 제거: 첫 번째 성분을 양수로 통일
-        sign = torch.sign(V_k[:, :1])
-        sign[sign == 0] = 1.0
-        V_k = V_k * sign
+    V_k, score = _fix_sign(V_k, Et, sign_mode)
 
     if r < k:  # 부족분은 0 (λ=0이면 √λ·q = 0이므로 정확한 값)
         d = Et.shape[1]
         S_k = torch.cat([S_k, S_k.new_zeros(k - r)])
         V_k = torch.cat([V_k, V_k.new_zeros(k - r, d)])
+        if score is not None:
+            score = torch.cat([score, score.new_zeros(k - r)])
 
     e_t = (S_k[:, None] * V_k).reshape(-1)   # [√λ₁q₁; ...; √λ_k q_k], (kd,)
     lam = S_k ** 2                           # λ_i = σ_i²
-    return e_t.cpu(), lam.cpu(), V_k.cpu()
+    score = score.cpu() if score is not None else None
+    return e_t.cpu(), lam.cpu(), V_k.cpu(), score
 
 
 @torch.no_grad()
-def episode_embeddings(views: list[torch.Tensor], k: int, scale: bool, fix_sign: bool):
-    e, lam, V = {}, {}, {}
+def episode_embeddings(views: list[torch.Tensor], k: int, scale: bool, sign_mode: str):
+    e, lam, V, sc = {}, {}, {}, {}
     for t, Et in enumerate(views):
-        e[t], lam[t], V[t] = spectral_embedding(Et.to(DEVICE), k, scale, fix_sign)
-    return e, lam, V
+        e[t], lam[t], V[t], s = spectral_embedding(Et.to(DEVICE), k, scale, sign_mode)
+        if s is not None:
+            sc[t] = s
+    return e, lam, V, sc
+
 
 def load_hidden_states(data_dir: Path, task: str, level: str, method: str,
                        status: str, ctx_tag: str = "with_prompt"):
@@ -57,15 +98,18 @@ def load_hidden_states(data_dir: Path, task: str, level: str, method: str,
         raise FileNotFoundError(f"no chunk_*.pt in {target}")
     return files
 
+
 @torch.no_grad()
 def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method: str,
-                 status: str, k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN,
-                 ctx_tag: str = "with_prompt"):
+                 status: str, k: int = K_EIG, scale: bool = SCALE,
+                 sign_mode: str = SIGN_MODE, ctx_tag: str = "with_prompt"):
 
     data_root = data_root.resolve()
     chunk_files = load_hidden_states(data_root, task, level, method, status, ctx_tag)
 
-    tag = f"k{k}" + ("_scaled" if scale else "") + ("_signfix" if fix_sign else "")
+    tag = f"k{k}" + ("_scaled" if scale else "")
+    if sign_mode != "none":
+        tag += f"_sign-{sign_mode}"
     rel = Path(task) / level
     out_dir = out_root / rel / method / ctx_tag / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -78,11 +122,14 @@ def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method:
         out = {}
         for seed, episode in chunk.items():
             _, views = load_step_views(episode)
-            e, lam, V = episode_embeddings(views, k, scale, fix_sign)
-            out[seed] = {"e": e, "eigvals": lam, "V": V}
+            e, lam, V, sc = episode_embeddings(views, k, scale, sign_mode)
+            rec = {"e": e, "eigvals": lam, "V": V}
+            if sc:
+                rec["sign_score"] = sc
+            out[seed] = rec
             n_episodes += 1
 
-        torch.save({"k": k, "scale": scale, "fix_sign": fix_sign,
+        torch.save({"k": k, "scale": scale, "sign_mode": sign_mode,
                     "src": str(cf), "model": MODEL, "episodes": out},
                    out_dir / cf.name)
 
