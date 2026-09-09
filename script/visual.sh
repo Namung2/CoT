@@ -6,7 +6,7 @@
 #   ./visual.sh              # 백그라운드로 떨어지고 바로 셸로 돌아옴
 #   tail -f nohup_*.out      # 진행 상황 보기
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 if [[ "${VISUAL_SH_BG:-}" != "1" ]]; then
     nohup_log="nohup_$(date +%Y%m%d_%H%M%S).out"

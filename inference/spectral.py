@@ -11,6 +11,20 @@ K_EIG = 8
 SCALE = True        # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
 SIGN_MODE = "data"  # "none" | "first" | "max" | "data"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SIGN_MODES = ("none", "first", "max", "data")
+
+
+def make_tag(k: int, scale: bool, sign_mode: str) -> str:
+    """spectral_states 저장 디렉토리 이름. 예: k8_scaled_sign-data, k8_scaled (none).
+
+    읽는 쪽(visual/heatmap.py, visual/step_similarity.py)도 이 함수를 써야 한다 —
+    문자열을 손으로 베끼면 규칙이 바뀔 때 조용히 어긋난다."""
+    if sign_mode not in SIGN_MODES:
+        raise ValueError(f"unknown sign_mode: {sign_mode!r} (choose from {SIGN_MODES})")
+    tag = f"k{k}" + ("_scaled" if scale else "")
+    if sign_mode != "none":
+        tag += f"_sign-{sign_mode}"
+    return tag
 
 
 def _fix_sign(V_k: torch.Tensor, Et: torch.Tensor, mode: str):
@@ -107,9 +121,7 @@ def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method:
     data_root = data_root.resolve()
     chunk_files = load_hidden_states(data_root, task, level, method, status, ctx_tag)
 
-    tag = f"k{k}" + ("_scaled" if scale else "")
-    if sign_mode != "none":
-        tag += f"_sign-{sign_mode}"
+    tag = make_tag(k, scale, sign_mode)
     rel = Path(task) / level
     out_dir = out_root / rel / method / ctx_tag / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -24,12 +24,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
 from extract import load_chunk                                          # noqa: E402
-from spectral import spectral_embedding, DEVICE, K_EIG, SCALE, FIX_SIGN  # noqa: E402
+from spectral import spectral_embedding, make_tag, DEVICE, K_EIG, SCALE, SIGN_MODE, SIGN_MODES  # noqa: E402
 
 
 @torch.no_grad()
 def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
-                           k: int, scale: bool, fix_sign: bool):
+                           k: int, scale: bool, sign_mode: str):
     """토큰마다 e_i 계산 (스텝 시작점부터 그 토큰까지 누적, 스텝 바뀌면 리셋).
 
     반환: e_all (N x kd), last_of_step ({스텝: 그 스텝 마지막 토큰의 e_i}) —
@@ -38,7 +38,7 @@ def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
     e_list, last_of_step = [], {}
     for t, (s, e) in enumerate(zip(boundaries, boundaries[1:])):
         for i in range(s, e):
-            e_i, _, _ = spectral_embedding(E[s:i + 1].to(DEVICE), k, scale, fix_sign)
+            e_i, _, _, _ = spectral_embedding(E[s:i + 1].to(DEVICE), k, scale, sign_mode)
             e_list.append(e_i)
         last_of_step[t] = e_list[-1] if e > s else None
     return torch.stack(e_list), last_of_step
@@ -91,8 +91,8 @@ def plot_heatmap(sim: torch.Tensor, boundaries: list[int], out_path: Path, title
 
 def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None = None,
         method: str = "full_sequence", ctx_tag: str = "with_prompt",
-        k: int = K_EIG, scale: bool = SCALE, fix_sign: bool = FIX_SIGN,
-        spectral_dir: Path | None = None, spectral_tag: str = "k8_scaled_signfix"):
+        k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
+        spectral_dir: Path | None = None):
     h_dir = hidden_dir / task / level / method / ctx_tag / status
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not chunk_files:
@@ -112,14 +112,18 @@ def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None =
         raise KeyError(f"seed {seed} not found under {h_dir}")
 
     E, boundaries = episode["E"], episode["boundaries"]
-    e_all, last_of_step = cumulative_within_step(E, boundaries, k, scale, fix_sign)
+    e_all, last_of_step = cumulative_within_step(E, boundaries, k, scale, sign_mode)
 
     if spectral_dir is not None:
+        spectral_tag = make_tag(k, scale, sign_mode)   # spectral.py 와 같은 규칙으로 디렉토리명 생성
         s_path = spectral_dir / task / level / method / ctx_tag / status / spectral_tag / chunk_name
         if s_path.exists():
             spectral_e = torch.load(s_path, map_location="cpu", weights_only=False)
             spectral_e = spectral_e["episodes"][seed]["e"]
             verify_against_spectral_states(last_of_step, spectral_e)
+        else:
+            print(f"warning: {s_path} 없음 — 5-1 vs 5-2 검증 건너뜀 "
+                  f"(같은 k/scale/sign_mode 로 spectral 을 먼저 돌렸는지 확인)", file=sys.stderr)
 
     sim = heatmap_matrix(e_all)
     return sim, boundaries, seed
@@ -134,6 +138,8 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="episode env_seed. 안 주면 첫 episode")
     ap.add_argument("--methods", default="full_sequence")
     ap.add_argument("-k", type=int, default=K_EIG)
+    ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
+                    help="spectral 과 같은 값을 줘야 spectral_states 검증이 맞물림")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "heatmap")
@@ -142,7 +148,7 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sim, boundaries, seed = run(args.hidden_dir, args.task, args.level, args.status,
                                seed=args.seed, method=args.methods, k=args.k,
-                               spectral_dir=args.spectral_dir)
+                               sign_mode=args.sign_mode, spectral_dir=args.spectral_dir)
 
     name = f"{args.task}_{args.level}_{args.status}_{seed}"
     plot_heatmap(sim, boundaries, args.out_dir / f"{name}.png",

@@ -130,17 +130,19 @@ def episode_status(episode: dict) -> str:
 
 # ------------------------------------------------------------------------- run
 
-def load_episodes(data_dir: Path):
-    data_dir = data_dir.resolve()
-    if not data_dir.is_dir():
-        raise FileNotFoundError(f"no such directory: {data_dir}")
+def load_episodes(path: Path) -> list[dict]:
+    """jsonl 파일 하나를 읽는다. 디렉토리 통째로 rglob 하지 않는 이유: data/ 아래에
+    thinking / no_thinking 파일이 같이 있으면 같은 (task, env_name, env_seed) 가
+    두 번 나와 id collision 으로 죽는다. 어느 파일을 읽을지는 호출 측이 정한다."""
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"no such file: {path}")
     episodes = []
-    for path in sorted(data_dir.rglob("*.jsonl")):
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    episodes.append((path, json.loads(line)))
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                episodes.append(json.loads(line))
     return episodes
 
 
@@ -150,23 +152,29 @@ def extract_run(
     task: str,
     level: str,
     method: str,
+    mode: str = "no_thinking",
     use_prompt_context: bool = True,
     chunk: int = 256,
 ):
     """episode마다 파일 하나 대신, chunk개씩 묶어 run_dir/<status>/chunk_NNNN.pt 로
     저장한다 (episode당 파일이면 레벨 하나에 최대 3만 개 생겨 inode/리스팅에 부담).
     meta.jsonl 각 줄에 env_seed/status/chunk를 남겨서, 특정 episode가 어느 파일의
-    어느 키에 들었는지 스캔 없이 바로 찾을 수 있게 한다."""
+    어느 키에 들었는지 스캔 없이 바로 찾을 수 있게 한다.
+
+    입력은 data_dir / f"{task}_{mode}.jsonl" 하나 — generate/cot_*.py 의 출력 파일명
+    규칙과 동일 (mode = "no_thinking" | "thinking")."""
     if method not in EXTRACTORS:
         raise ValueError(f"unknown method: {method!r} (choose from {list(EXTRACTORS)})")
     extractor = EXTRACTORS[method]
 
-    all_episodes = load_episodes(data_dir)
-    episodes = [(p, e) for p, e in all_episodes
-               if e.get("task") == task and e.get("env_name") == level]
+    src = data_dir / f"{task}_{mode}.jsonl"
+    all_episodes = load_episodes(src)
+    # task 는 파일명으로 이미 정해졌지만 행 안의 task 필드도 맞는지 한 번 더 본다
+    episodes = [e for e in all_episodes
+                if e.get("task") == task and e.get("env_name") == level]
     if not episodes:
         raise ValueError(f"no episodes with task == {task!r} and env_name == {level!r} "
-                         f"under {data_dir} ({len(all_episodes)} loaded total)")
+                         f"in {src} ({len(all_episodes)} loaded total)")
 
     ctx_tag = "with_prompt" if use_prompt_context else "no_prompt"
     run_dir = out_root / task / level / method / ctx_tag
@@ -192,9 +200,9 @@ def extract_run(
 
     n_saved = n_skipped = 0
     with meta_path.open("w", encoding="utf-8") as mf:
-        for path, episode in tqdm(episodes, desc="episodes", unit="episode"):
+        for episode in tqdm(episodes, desc="episodes", unit="episode"):
             meta = build_meta(episode)
-            meta["src"] = path.name
+            meta["src"] = src.name
 
             if episode.get("skipped"):               # 출력 자체가 없는 에피소드
                 meta["extract_skipped"] = "no_output"

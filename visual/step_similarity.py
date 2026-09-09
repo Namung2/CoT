@@ -18,16 +18,16 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from pathlib import Path
 
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "inference"))
 
-
-def load_chunk(pt_path: Path) -> dict:
-    """청크 파일 하나 로드. {env_seed: {"E":..., "boundaries":..., ...}, ...} 반환."""
-    return torch.load(pt_path, map_location="cpu", weights_only=False)["episodes"]
+from extract import load_chunk                                      # noqa: E402
+from spectral import make_tag, K_EIG, SCALE, SIGN_MODE, SIGN_MODES  # noqa: E402
 
 
 def intra_step_similarity(E: torch.Tensor, boundaries: list[int]) -> dict[int, float]:
@@ -62,12 +62,15 @@ def inter_step_similarity(reps: dict[int, torch.Tensor]) -> dict[int, list[float
 
 def run(hidden_dir: Path, spectral_dir: Path, task: str, level: str, status: str,
         seed: int | None = None, method: str = "full_sequence", ctx_tag: str = "with_prompt",
-        spectral_tag: str = "k8_scaled_signfix"):
+        k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE):
     """seed=None이면 레벨 전체 episode를 다 풀링해서 평균(기존 동작).
     seed를 주면 그 episode 하나만 갖고 계산 — 다른 episode랑 안 섞임."""
     h_dir = hidden_dir / task / level / method / ctx_tag / status
-    s_dir = spectral_dir / task / level / method / ctx_tag / status / spectral_tag
+    s_dir = spectral_dir / task / level / method / ctx_tag / status / make_tag(k, scale, sign_mode)
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
+    if not s_dir.is_dir():
+        print(f"warning: {s_dir} 없음 — inter_step_e_t 가 비게 됨 "
+              f"(같은 k/scale/sign_mode 로 spectral 을 먼저 돌렸는지 확인)", file=sys.stderr)
     if not chunk_files:
         raise FileNotFoundError(f"no chunk_*.pt in {h_dir}")
 
@@ -180,6 +183,9 @@ def main():
                     help="episode env_seed. 주면 그 episode 하나만 계산(다른 episode랑 안 섞임). "
                          "안 주면 레벨 전체 episode를 풀링해서 평균(기존 동작)")
     ap.add_argument("--methods", default="full_sequence")
+    ap.add_argument("-k", type=int, default=K_EIG)
+    ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
+                    help="읽을 spectral_states 디렉토리를 정함 (spectral 을 돌린 값과 같게)")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "step_similarity")
@@ -191,7 +197,7 @@ def main():
         name += f"_{args.seed}"
 
     summary = run(args.hidden_dir, args.spectral_dir, args.task, args.level, args.status,
-                 seed=args.seed, method=args.methods)
+                 seed=args.seed, method=args.methods, k=args.k, sign_mode=args.sign_mode)
 
     (args.out_dir / f"{name}.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

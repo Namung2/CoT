@@ -12,7 +12,7 @@
 #   tail -f nohup_*.out     # 진행 상황 보기
 #   kill <pid>              # 중단하고 싶으면 (시작할 때 찍히는 pid)
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # 스스로를 nohup+setsid로 재실행해서 백그라운드로 떨어뜨린다. 이미 백그라운드로
 # 재실행된 상태(INFERENCE_SH_BG=1)면 이 블록은 건너뛰고 바로 본 작업으로 간다.
