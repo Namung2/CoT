@@ -83,7 +83,7 @@ def plot_heatmap(sim: torch.Tensor, boundaries: list[int], out_path: Path, title
     labels = [f"Step {t}" for t in range(len(boundaries) - 1)]
     ax.set_xticks(mids); ax.set_xticklabels(labels, rotation=90, fontsize=7)
     ax.set_yticks(mids); ax.set_yticklabels(labels, fontsize=7)
-    ax.set_title(title)
+    ax.set_title(title, fontsize=9)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -92,7 +92,7 @@ def plot_heatmap(sim: torch.Tensor, boundaries: list[int], out_path: Path, title
 def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None = None,
         method: str = "full_sequence", ctx_tag: str = "with_prompt",
         k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
-        spectral_dir: Path | None = None):
+        spectral_dir: Path | None = None, rep: str = "spectral"):
     h_dir = hidden_dir / task / level / method / ctx_tag / status
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not chunk_files:
@@ -112,6 +112,12 @@ def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None =
         raise KeyError(f"seed {seed} not found under {h_dir}")
 
     E, boundaries = episode["E"], episode["boundaries"]
+
+    if rep == "raw":
+        # spectral 을 안 거친 원본 토큰 벡터(5120) 끼리의 코사인. 누적도 리셋도 없다.
+        sim = heatmap_matrix(E.float())
+        return sim, boundaries, seed
+
     e_all, last_of_step = cumulative_within_step(E, boundaries, k, scale, sign_mode)
 
     if spectral_dir is not None:
@@ -137,6 +143,8 @@ def main():
     ap.add_argument("--status", default="success", choices=["success", "failure"])
     ap.add_argument("--seed", type=int, default=None, help="episode env_seed. 안 주면 첫 episode")
     ap.add_argument("--methods", default="full_sequence")
+    ap.add_argument("--rep", default="spectral", choices=["spectral", "raw"],
+                    help="spectral=토큰별 누적 e_t 끼리 코사인(기본) | raw=원본 5120차원 토큰끼리 코사인")
     ap.add_argument("-k", type=int, default=K_EIG)
     ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
                     help="spectral 과 같은 값을 줘야 spectral_states 검증이 맞물림")
@@ -145,16 +153,27 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "heatmap")
     args = ap.parse_args()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     sim, boundaries, seed = run(args.hidden_dir, args.task, args.level, args.status,
                                seed=args.seed, method=args.methods, k=args.k,
-                               sign_mode=args.sign_mode, spectral_dir=args.spectral_dir)
+                               sign_mode=args.sign_mode, spectral_dir=args.spectral_dir,
+                               rep=args.rep)
 
-    name = f"{args.task}_{args.level}_{args.status}_{seed}"
-    plot_heatmap(sim, boundaries, args.out_dir / f"{name}.png",
-                title=f"{args.task}/{args.level}/{args.status} seed={seed} (n_tok={sim.shape[0]})")
+    # raw 는 k/부호와 무관하므로 raw/<status>/ 로 따로 둔다.
+    if args.rep == "raw":
+        tag = "raw"
+        out_dir = args.out_dir / "raw" / args.status
+    else:
+        tag = make_tag(args.k, SCALE, args.sign_mode)
+        # 한 디렉토리에 다 쌓이면 못 찾는다 → k / status / 부호모드 로 3단 분리.
+        # 파일명에는 전체 tag 를 남겨서 파일 하나만 떼어 봐도 설정을 알 수 있게 둔다.
+        out_dir = args.out_dir / f"k{args.k}" / args.status / args.sign_mode
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{args.task}_{args.level}_{args.status}_{seed}_{tag}"
+    plot_heatmap(sim, boundaries, out_dir / f"{name}.png",
+                title=f"{args.task}/{args.level}/{args.status} seed={seed} "
+                      f"(n_tok={sim.shape[0]})\n{tag}")
     print(f"n_tokens={sim.shape[0]} n_steps={len(boundaries) - 1}")
-    print(f"saved -> {args.out_dir / name}.png")
+    print(f"saved -> {out_dir / name}.png")
 
 
 if __name__ == "__main__":

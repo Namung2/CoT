@@ -20,3 +20,4 @@ anthropic
 # --- 분석 / 시각화 ---
 matplotlib==3.10.8
 scikit-learn==1.8.0
+statesegmentation==0.0.6   # GSBS 상태 분할 (inference/segment_states.py)
