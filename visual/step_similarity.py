@@ -61,12 +61,12 @@ def inter_step_similarity(reps: dict[int, torch.Tensor]) -> dict[int, list[float
 
 
 def run(hidden_dir: Path, spectral_dir: Path, task: str, level: str, status: str,
-        seed: int | None = None, method: str = "full_sequence", ctx_tag: str = "with_prompt",
+        seed: int | None = None, ctx_tag: str = "with_prompt",
         k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE):
     """seed=None이면 레벨 전체 episode를 다 풀링해서 평균(기존 동작).
     seed를 주면 그 episode 하나만 갖고 계산 — 다른 episode랑 안 섞임."""
-    h_dir = hidden_dir / task / level / method / ctx_tag / status
-    s_dir = spectral_dir / task / level / method / ctx_tag / status / make_tag(k, scale, sign_mode)
+    h_dir = hidden_dir / task / level / ctx_tag / status
+    s_dir = spectral_dir / task / level / ctx_tag / status / make_tag(k, scale, sign_mode)
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not s_dir.is_dir():
         print(f"warning: {s_dir} 없음 — inter_step_e_t 가 비게 됨 "
@@ -182,7 +182,6 @@ def main():
     ap.add_argument("--seed", type=int, default=None,
                     help="episode env_seed. 주면 그 episode 하나만 계산(다른 episode랑 안 섞임). "
                          "안 주면 레벨 전체 episode를 풀링해서 평균(기존 동작)")
-    ap.add_argument("--methods", default="full_sequence")
     ap.add_argument("-k", type=int, default=K_EIG)
     ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
                     help="읽을 spectral_states 디렉토리를 정함 (spectral 을 돌린 값과 같게)")
@@ -197,7 +196,7 @@ def main():
         name += f"_{args.seed}"
 
     summary = run(args.hidden_dir, args.spectral_dir, args.task, args.level, args.status,
-                 seed=args.seed, method=args.methods, k=args.k, sign_mode=args.sign_mode)
+                 seed=args.seed, k=args.k, sign_mode=args.sign_mode)
 
     (args.out_dir / f"{name}.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from extract import EXTRACTORS, extract_run
+from extract import extract_run
 from spectral import SIGN_MODES, spectral_run
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,13 +18,11 @@ def parse_args():
                         "CustomBabyAI-GoToRedBall-Small-4Dists-v0")
     p.add_argument("--status", default="success", choices=["success", "failure"],
                    help="spectral 단계에서 읽을 대상 (extract는 항상 둘 다 저장)")
-    p.add_argument("--methods", nargs="+", default=["full_sequence"],
-                   choices=list(EXTRACTORS))
     p.add_argument("--mode", default="no_thinking", choices=["no_thinking", "thinking"],
-                   help="읽을 파일: data-dir/{task}_{mode}.jsonl (generate/cot_*.py 출력명 규칙)")
+                   help="읽을 파일: data-dir/{task}_{mode}.jsonl (generation/scripts/cot_*.py 출력명 규칙)")
 
     # 경로
-    p.add_argument("--data-dir", type=Path, default=ROOT / "data")
+    p.add_argument("--data-dir", type=Path, default=ROOT / "generation" / "trajectory")
     p.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     p.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
 
@@ -49,20 +47,19 @@ def parse_args():
 def main():
     a = parse_args()
 
-    for method in a.methods:
-        if a.extract:
-            extract_run(data_dir=a.data_dir, out_root=a.hidden_dir,
-                        task=a.task, level=a.level, method=method, mode=a.mode)
+    if a.extract:
+        extract_run(data_dir=a.data_dir, out_root=a.hidden_dir,
+                    task=a.task, level=a.level, mode=a.mode)
 
-        if not a.spectral:
-            continue
+    if not a.spectral:
+        return
 
-        for k in a.k:
-            for scale in a.scale:
-                for sign_mode in a.sign_mode:
-                    spectral_run(data_root=a.hidden_dir, out_root=a.spectral_dir,
-                                 task=a.task, level=a.level, method=method,
-                                 status=a.status, k=k, scale=scale, sign_mode=sign_mode)
+    for k in a.k:
+        for scale in a.scale:
+            for sign_mode in a.sign_mode:
+                spectral_run(data_root=a.hidden_dir, out_root=a.spectral_dir,
+                             task=a.task, level=a.level,
+                             status=a.status, k=k, scale=scale, sign_mode=sign_mode)
 
 
 if __name__ == "__main__":

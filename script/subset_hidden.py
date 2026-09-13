@@ -49,7 +49,7 @@ def subset(src_dir: Path, dst_dir: Path, n: int | None, seeds: list[int] | None)
     out = dst_dir / "chunk_0000.pt"
     torch.save({**header, "episodes": picked}, out)
     size_mb = out.stat().st_size / 1e6
-    print(f"{src_dir.relative_to(src_dir.parents[4])}: {len(picked)} episodes "
+    print(f"{src_dir.relative_to(src_dir.parents[3])}: {len(picked)} episodes "
           f"(seeds {sorted(picked)[:5]}{'...' if len(picked) > 5 else ''}) -> {out} ({size_mb:.0f} MB)")
 
 
@@ -59,7 +59,6 @@ def main():
     ap.add_argument("--task", required=True, choices=["decompose", "plan", "predict"])
     ap.add_argument("--level", required=True)
     ap.add_argument("--status", nargs="+", default=["success", "failure"])
-    ap.add_argument("--methods", default="full_sequence")
     ap.add_argument("--ctx-tag", default="with_prompt")
     ap.add_argument("--n", type=int, default=10, help="status 당 뽑을 episode 수 (--seeds 주면 무시)")
     ap.add_argument("--seeds", type=int, nargs="+", default=None, help="특정 env_seed 만")
@@ -68,7 +67,7 @@ def main():
     args = ap.parse_args()
 
     for status in args.status:
-        rel = Path(args.task) / args.level / args.methods / args.ctx_tag / status
+        rel = Path(args.task) / args.level / args.ctx_tag / status
         subset(args.hidden_dir / rel, args.out / rel,
                None if args.seeds else args.n, args.seeds)
 

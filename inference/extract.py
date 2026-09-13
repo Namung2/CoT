@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-from segment import split_steps
 MODEL = "Qwen/Qwen3-32B"
 MAX_TOKENS = 32768                       # 초과 시 skip (meta에 기록)
 HEAVY_FIELDS = ("prompt", "all_llm_output", "parsed_llm_output")
@@ -29,95 +29,69 @@ def ensure_model():
     return tok, model
 
 
+# ------------------------------------------------------------- step boundaries
+
+STEP_PAT = re.compile(r"(?mi)^(?:#+\s*|\*+\s*)?Step\s*(\d+)\s*[.:]")
+
+def step_char_bounds(text: str) -> list[int]:
+    if not text.strip():
+        return [0, len(text)]
+
+    starts = [m.start() for m in STEP_PAT.finditer(text)]
+    if not starts:
+        return [0, len(text)]
+    if text[:starts[0]].strip():
+        starts = [0] + starts
+    else:
+        starts[0] = 0
+    return starts + [len(text)]
+
+
+def char_to_token_bounds(char_bounds: list[int], offsets) -> list[int]:
+    tok_bounds, k = [], 0
+    for cb in char_bounds:
+        while k < len(offsets) and offsets[k][0] < cb:
+            k += 1
+        tok_bounds.append(k)
+    return tok_bounds
+
+
 # ---------------------------------------------------------------- tokenization
 
 def tokenize_episode(episode: dict, use_prompt_context: bool):
-    """원문을 1회 토큰화하고 step 경계를 토큰 좌표로 매핑.
-
-    반환:
-      ids        : forward에 넣을 전체 토큰 (prompt 포함 여부는 flag에 따름)
-      ctx        : output 시작 전 컨텍스트 토큰 수 (prompt 미사용 시 0)
-      boundaries : 길이 T+1, output 토큰 기준 step 경계.
-                   step t = E[boundaries[t]:boundaries[t+1]]
-    """
+ 
     ensure_model()
-    output = episode["all_llm_output"]
-    steps = split_steps(output)
-    assert "".join(steps) == output
-
     prompt = episode["prompt"] if use_prompt_context else ""
-    text = prompt + output
+    output = episode["all_llm_output"]
 
-    enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
-    ids, offs = enc.input_ids, enc.offset_mapping
+    enc = tok(prompt + output, add_special_tokens=False, return_offsets_mapping=True)
 
-    # char 경계(누적 길이) → token 경계. 토큰의 시작 문자가 속한 구간에 배정.
-    char_bounds = [len(prompt)]
-    for s in steps:
-        char_bounds.append(char_bounds[-1] + len(s))
-
-    tok_bounds, k = [], 0
-    for cb in char_bounds:
-        while k < len(ids) and offs[k][0] < cb:
-            k += 1
-        tok_bounds.append(k)
-    assert tok_bounds[-1] == len(ids), "unconsumed tokens"
+    char_bounds = [len(prompt) + b for b in step_char_bounds(output)]
+    tok_bounds = char_to_token_bounds(char_bounds, enc.offset_mapping)
+    assert tok_bounds[-1] == len(enc.input_ids), "unconsumed tokens"
 
     ctx = tok_bounds[0]                              # prompt 토큰 수
     boundaries = [b - ctx for b in tok_bounds]       # output 기준으로 shift
-    return ids, ctx, boundaries
+    return enc.input_ids, ctx, boundaries
 
 
-# ------------------------------------------------------------------ extractors
+# ------------------------------------------------------------------- extractor
 
 @torch.no_grad()
-def extract_full_sequence(ids, ctx, boundaries):
-    """전체 1회 forward. output 구간만 저장 → E: (output 토큰수) x d."""
+def extract_hidden(ids, ctx):
     ensure_model()
     H = model(torch.tensor([ids], device=model.device)).last_hidden_state[0]
     return H[ctx:].to(torch.bfloat16).cpu().clone()
 
 
-@torch.no_grad()
-def extract_cumulative_prefix(ids, ctx, boundaries):
-    """step t마다 prefix(ids[:ctx+b_{t+1}])로 forward, 해당 step 구간만 누적.
-
-    full_sequence와 동일한 ids/boundaries를 쓰므로 토큰열이 완전히 일치.
-    반환 shape은 동일하게 (output 토큰수) x d이나, 행마다 forward된
-    prefix 길이가 다르다는 점은 분석 시 해석에 반영할 것.
-    """
-    ensure_model()
-    rows = []
-    for s, e in zip(boundaries, boundaries[1:]):
-        H = model(
-            torch.tensor([ids[: ctx + e]], device=model.device)
-        ).last_hidden_state[0]
-        rows.append(H[ctx + s : ctx + e].to(torch.bfloat16).cpu())
-    return torch.cat(rows, dim=0)
-
-
-EXTRACTORS = {
-    "full_sequence": extract_full_sequence,
-    "cumulative_prefix": extract_cumulative_prefix,
-}
-
-
 # ------------------------------------------------------------------------ meta
 
 def build_meta(episode: dict) -> dict:
-    """heavy 텍스트 필드만 빼고 전부 복사 (task별 확장 필드 자동 포함)."""
     return {k: v for k, v in episode.items() if k not in HEAVY_FIELDS}
 
 
 def episode_status(episode: dict) -> str:
-    """성공/실패 → 저장 디렉토리 분기.
 
-    eval_result 포맷이 task마다 다름:
-      - {"success": bool, ...}  → success 그대로 사용
-      - {"CR": float, ...}      → CR == 1 을 성공으로 판정 (기준 바뀌면 여기 수정)
-      - 비어있음(None/{})       → eval 자체가 실패(파싱 실패/봇 예외/타임아웃,
-                                   eval_error에 기록됨) → failure로 분류
-    """
     r = episode.get("eval_result") or {}
     if "success" in r:
         return "success" if r["success"] else "failure"
@@ -131,9 +105,7 @@ def episode_status(episode: dict) -> str:
 # ------------------------------------------------------------------------- run
 
 def load_episodes(path: Path) -> list[dict]:
-    """jsonl 파일 하나를 읽는다. 디렉토리 통째로 rglob 하지 않는 이유: data/ 아래에
-    thinking / no_thinking 파일이 같이 있으면 같은 (task, env_name, env_seed) 가
-    두 번 나와 id collision 으로 죽는다. 어느 파일을 읽을지는 호출 측이 정한다."""
+
     path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(f"no such file: {path}")
@@ -151,25 +123,14 @@ def extract_run(
     out_root: Path,
     task: str,
     level: str,
-    method: str,
     mode: str = "no_thinking",
     use_prompt_context: bool = True,
     chunk: int = 256,
 ):
-    """episode마다 파일 하나 대신, chunk개씩 묶어 run_dir/<status>/chunk_NNNN.pt 로
-    저장한다 (episode당 파일이면 레벨 하나에 최대 3만 개 생겨 inode/리스팅에 부담).
-    meta.jsonl 각 줄에 env_seed/status/chunk를 남겨서, 특정 episode가 어느 파일의
-    어느 키에 들었는지 스캔 없이 바로 찾을 수 있게 한다.
-
-    입력은 data_dir / f"{task}_{mode}.jsonl" 하나 — generate/cot_*.py 의 출력 파일명
-    규칙과 동일 (mode = "no_thinking" | "thinking")."""
-    if method not in EXTRACTORS:
-        raise ValueError(f"unknown method: {method!r} (choose from {list(EXTRACTORS)})")
-    extractor = EXTRACTORS[method]
 
     src = data_dir / f"{task}_{mode}.jsonl"
     all_episodes = load_episodes(src)
-    # task 는 파일명으로 이미 정해졌지만 행 안의 task 필드도 맞는지 한 번 더 본다
+    
     episodes = [e for e in all_episodes
                 if e.get("task") == task and e.get("env_name") == level]
     if not episodes:
@@ -177,7 +138,7 @@ def extract_run(
                          f"in {src} ({len(all_episodes)} loaded total)")
 
     ctx_tag = "with_prompt" if use_prompt_context else "no_prompt"
-    run_dir = out_root / task / level / method / ctx_tag
+    run_dir = out_root / task / level / ctx_tag
     for status in ("success", "failure"):
         d = run_dir / status
         d.mkdir(parents=True, exist_ok=True)
@@ -193,7 +154,7 @@ def extract_run(
         if not buffers[status]:
             return
         out_path = run_dir / status / f"chunk_{chunk_idx[status]:04d}.pt"
-        torch.save({"episodes": buffers[status], "method": method,
+        torch.save({"episodes": buffers[status],
                     "use_prompt_context": use_prompt_context, "model": MODEL}, out_path)
         buffers[status] = {}
         chunk_idx[status] += 1
@@ -229,7 +190,7 @@ def extract_run(
                 n_skipped += 1
                 continue
 
-            E = extractor(ids, ctx, boundaries)
+            E = extract_hidden(ids, ctx)
             assert E.shape[0] == boundaries[-1]
 
             seed = episode["env_seed"]
@@ -257,14 +218,11 @@ def extract_run(
 # ----------------------------------------------------------------- load helper
 
 def load_chunk(pt_path: Path) -> dict:
-    """청크 파일 하나 로드. {env_seed: {"E":..., "boundaries":..., ...}, ...} 반환."""
+
     return torch.load(pt_path, map_location="cpu", weights_only=False)["episodes"]
 
 
 def load_step_views(episode: dict) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """episode dict({"E","boundaries"})에서 N x d 행렬과 step별 view 리스트를 반환.
 
-    view라서 복사 비용 없음. E_t = views[t] (n_t x d).
-    """
     E, b = episode["E"], episode["boundaries"]
     return E, [E[s:e] for s, e in zip(b, b[1:])]

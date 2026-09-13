@@ -90,10 +90,10 @@ def plot_heatmap(sim: torch.Tensor, boundaries: list[int], out_path: Path, title
 
 
 def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None = None,
-        method: str = "full_sequence", ctx_tag: str = "with_prompt",
+        ctx_tag: str = "with_prompt",
         k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
         spectral_dir: Path | None = None, rep: str = "spectral"):
-    h_dir = hidden_dir / task / level / method / ctx_tag / status
+    h_dir = hidden_dir / task / level / ctx_tag / status
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not chunk_files:
         raise FileNotFoundError(f"no chunk_*.pt in {h_dir}")
@@ -122,7 +122,7 @@ def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None =
 
     if spectral_dir is not None:
         spectral_tag = make_tag(k, scale, sign_mode)   # spectral.py 와 같은 규칙으로 디렉토리명 생성
-        s_path = spectral_dir / task / level / method / ctx_tag / status / spectral_tag / chunk_name
+        s_path = spectral_dir / task / level / ctx_tag / status / spectral_tag / chunk_name
         if s_path.exists():
             spectral_e = torch.load(s_path, map_location="cpu", weights_only=False)
             spectral_e = spectral_e["episodes"][seed]["e"]
@@ -142,7 +142,6 @@ def main():
     ap.add_argument("--level", required=True)
     ap.add_argument("--status", default="success", choices=["success", "failure"])
     ap.add_argument("--seed", type=int, default=None, help="episode env_seed. 안 주면 첫 episode")
-    ap.add_argument("--methods", default="full_sequence")
     ap.add_argument("--rep", default="spectral", choices=["spectral", "raw"],
                     help="spectral=토큰별 누적 e_t 끼리 코사인(기본) | raw=원본 5120차원 토큰끼리 코사인")
     ap.add_argument("-k", type=int, default=K_EIG)
@@ -154,7 +153,7 @@ def main():
     args = ap.parse_args()
 
     sim, boundaries, seed = run(args.hidden_dir, args.task, args.level, args.status,
-                               seed=args.seed, method=args.methods, k=args.k,
+                               seed=args.seed, k=args.k,
                                sign_mode=args.sign_mode, spectral_dir=args.spectral_dir,
                                rep=args.rep)
 

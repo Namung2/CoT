@@ -16,8 +16,8 @@ cot_predict.py 와 동일한 생성 로직이지만 두 가지가 다르다.
 출력 파일은 cot_predict.py 와 동일한 경로 규칙을 쓰므로, cot_predict.py 로 만들다
 중단된 데이터를 그대로 이어서 생성할 수 있다 (done_keys 기반 resume 공유).
 
-    python generate/cot_predict.py                # thinking off
-    python generate/cot_predict.py --thinking     # thinking on
+    python generation/scripts/cot_predict.py                # thinking off
+    python generation/scripts/cot_predict.py --thinking     # thinking on
 """
 from __future__ import annotations
 
@@ -27,8 +27,9 @@ import signal
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]   # repo 루트 (이 파일은 generate/ 아래)
-_VENDOR = ROOT / "third_party" / "llm-babybench"
+ROOT = Path(__file__).resolve().parents[2]   # repo 루트 (이 파일은 generation/scripts/ 아래)
+TRAJ_DIR = ROOT / "generation" / "trajectory"  # 생성 결과 jsonl; inference/main.py --data-dir 기본값과 동일
+_VENDOR = ROOT / "generation" / "third_party" / "llm-babybench"
 if _VENDOR.is_dir():
     sys.path.insert(0, str(_VENDOR))
 
@@ -128,7 +129,7 @@ def main():
     args = ap.parse_args()
 
     mode = "thinking" if args.thinking else "no_thinking"
-    out = Path(args.out) if args.out else ROOT / "data" / f"predict_{mode}.jsonl"
+    out = Path(args.out) if args.out else TRAJ_DIR / f"predict_{mode}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
 
     fmt = get_formatter(FORMATTER)

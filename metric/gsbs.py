@@ -87,11 +87,17 @@ def reduce_features(X: np.ndarray, r: int) -> np.ndarray:
     return np.ascontiguousarray(V[:, idx] * np.sqrt(np.clip(w[idx], 0, None)), dtype=np.float64)
 
 
-def run_gsbs(X_t: torch.Tensor, kmax: int | None, reduce: int | None):
+def run_gsbs(X_t: torch.Tensor, kmax: int | None, reduce: int | None,
+             statewise: bool = False):
     """X_t: (시점, 복셀) -> (경계 인덱스 배열, GSBS 객체, 실제 입력 X).
 
     kmax=None이면 문서 권장값인 시점수/2. 경계는 "그 시점에서 상태가 바뀐다"는 뜻이라
-    0번 시점에는 절대 안 붙는다. reduce=None이면 축소 안 함."""
+    0번 시점에는 절대 안 붙는다. reduce=None이면 축소 안 함.
+
+    statewise: GSBS의 statewise_detection. 켜면 경계를 한 번에 두 개씩 놓아 보느라
+    모든 시점 쌍을 훑어서 시점수의 3.6제곱쯤으로 느려진다. 566토큰 실측:
+        꺼짐 kmax=50  ->  13초,  켜짐 kmax=10 -> 710초.  결과(상태 2, 경계 533)는 동일.
+    그래서 기본은 꺼짐. 켜진 쪽이 저자들의 개선판이니 최종 확인용으로만 켤 것."""
     from statesegmentation import GSBS
 
     X = X_t.float().numpy().astype(np.float64)
@@ -102,7 +108,7 @@ def run_gsbs(X_t: torch.Tensor, kmax: int | None, reduce: int | None):
     n = X.shape[0]
     kmax = max(2, n // 2) if kmax is None else int(min(kmax, max(2, n // 2)))
 
-    g = GSBS(kmax=kmax, x=X)
+    g = GSBS(kmax=kmax, x=X, statewise_detection=statewise)
     g.fit(showProgressBar=False)
     return np.nonzero(g.get_deltas())[0], g, X
 
@@ -207,8 +213,8 @@ def plot_reset(E: torch.Tensor, true_b: list[int], gsbs_b: list[int],
 # ---------------------------------------------------------------------- 실행
 
 def load_episode(hidden_dir: Path, task: str, level: str, status: str,
-                 seed: int | None, method: str, ctx_tag: str):
-    h_dir = hidden_dir / task / level / method / ctx_tag / status
+                 seed: int | None, ctx_tag: str):
+    h_dir = hidden_dir / task / level / ctx_tag / status
     files = sorted(h_dir.glob("chunk_*.pt"))
     if not files:
         raise FileNotFoundError(f"no chunk_*.pt in {h_dir}")
@@ -230,7 +236,6 @@ def main():
     ap.add_argument("--seed", type=int, default=None, help="env_seed. 안 주면 첫 episode")
     ap.add_argument("--input", default="tokens", choices=["tokens", "spectral"],
                     help="tokens=원본 E(복셀 5120) | spectral=토큰별 누적 e_t(복셀 k*5120)")
-    ap.add_argument("--methods", default="full_sequence")
     ap.add_argument("--ctx-tag", default="with_prompt")
     ap.add_argument("--kmax", type=int, default=None,
                     help="GSBS 최대 상태 수. 기본은 토큰수/2 (문서 권장값). 크면 느리다")
@@ -238,6 +243,8 @@ def main():
                     help="행중심화 SVD로 복셀 축소. 0(기본)=full rank(=시점수)로 무손실 축소, "
                          "양수=상위 N개만, 음수=축소 안 함(원본 차원 그대로)")
     ap.add_argument("--tol", type=int, default=5, help="경계 매칭 허용 오차 (토큰)")
+    ap.add_argument("--statewise", action="store_true",
+                    help="GSBS statewise_detection 켜기. 50배 느리고 실측상 결과 동일 (run_gsbs 참고)")
     ap.add_argument("-k", type=int, default=K_EIG, help="reset 그림의 spectral 고유값 개수")
     ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES))
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
@@ -245,14 +252,15 @@ def main():
     args = ap.parse_args()
 
     seed, ep = load_episode(args.hidden_dir, args.task, args.level, args.status,
-                            args.seed, args.methods, args.ctx_tag)
+                            args.seed, args.ctx_tag)
     E, true_b = ep["E"], ep["boundaries"]
     n = E.shape[0]
     print(f"seed={seed}  tokens={n}  dims={E.shape[1]}  CoT steps={len(true_b) - 1}")
 
     t0 = time.perf_counter()
     X_in = build_input(E, true_b, args.input, args.k, SCALE, args.sign_mode)
-    pred_b, g, X = run_gsbs(X_in, args.kmax, None if args.reduce < 0 else args.reduce)
+    pred_b, g, X = run_gsbs(X_in, args.kmax, None if args.reduce < 0 else args.reduce,
+                            statewise=args.statewise)
     print(f"GSBS: {g.nstates} states, {pred_b.size} boundaries "
           f"(kmax={g.kmax}, voxels {X_in.shape[1]}->{X.shape[1]}, "
           f"{time.perf_counter() - t0:.0f}s)")
@@ -292,7 +300,7 @@ def main():
     out_json.write_text(json.dumps({
         "task": args.task, "level": args.level, "status": args.status, "env_seed": int(seed),
         "n_tokens": int(n), "voxels_in": int(X_in.shape[1]),
-        "voxels_used": int(X.shape[1]), "reduce": args.reduce,
+        "voxels_used": int(X.shape[1]), "reduce": args.reduce, "statewise": args.statewise,
         "kmax": int(g.kmax), "kmax_saturated": bool(g.nstates >= g.kmax - 1),
         "n_states_gsbs": int(g.nstates), "n_steps_true": len(true_b) - 1,
         "input": args.input, "k": args.k, "sign_mode": args.sign_mode,

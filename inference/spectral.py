@@ -101,9 +101,9 @@ def episode_embeddings(views: list[torch.Tensor], k: int, scale: bool, sign_mode
     return e, lam, V, sc
 
 
-def load_hidden_states(data_dir: Path, task: str, level: str, method: str,
+def load_hidden_states(data_dir: Path, task: str, level: str,
                        status: str, ctx_tag: str = "with_prompt"):
-    target = data_dir / task / level / method / ctx_tag / status
+    target = data_dir / task / level / ctx_tag / status
     if not target.is_dir():
         raise FileNotFoundError(f"no such directory: {target}")
 
@@ -114,22 +114,22 @@ def load_hidden_states(data_dir: Path, task: str, level: str, method: str,
 
 
 @torch.no_grad()
-def spectral_run(data_root: Path, out_root: Path, task: str, level: str, method: str,
+def spectral_run(data_root: Path, out_root: Path, task: str, level: str,
                  status: str, k: int = K_EIG, scale: bool = SCALE,
                  sign_mode: str = SIGN_MODE, ctx_tag: str = "with_prompt"):
 
     data_root = data_root.resolve()
-    chunk_files = load_hidden_states(data_root, task, level, method, status, ctx_tag)
+    chunk_files = load_hidden_states(data_root, task, level, status, ctx_tag)
 
     tag = make_tag(k, scale, sign_mode)
     rel = Path(task) / level
-    out_dir = out_root / rel / method / ctx_tag / status / tag
+    out_dir = out_root / rel / ctx_tag / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("chunk_*.pt"):   # hidden_states 청크 개수가 줄었을 때 낡은 파일 안 남게
         old.unlink()
 
     n_episodes = 0
-    for cf in tqdm(chunk_files, desc=f"{rel}/{method}/{tag}", unit="chunk"):
+    for cf in tqdm(chunk_files, desc=f"{rel}/{tag}", unit="chunk"):
         chunk = load_chunk(cf)
         out = {}
         for seed, episode in chunk.items():
