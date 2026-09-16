@@ -63,8 +63,12 @@ def step_char_bounds(text: str, task: str) -> tuple[list[int] | None, str | None
 
     깨끗한 궤적만 남긴다. 헤더가 없거나, Step 1 앞에 서문이 있거나,
     스텝 번호가 1,2,3.. 으로 안 이어지거나, 스텝이 MAX_STEPS 를 넘으면 버린다.
+
+    정규식은 출력 텍스트에만 건다. 프롬프트에도 "Step 1." 류 목차가 들어 있어서
+    (cot_*.py 의 프롬프트가 6단계 지시문) 이어붙인 전체 텍스트에 걸면 프롬프트
+    쪽 헤더가 먼저 잡힌다.
     """
-    if not text.strip():
+    if not text or not text.strip():
         return None, "empty_output"
 
     try:
@@ -176,16 +180,26 @@ def build_meta(episode: dict) -> dict:
     return {k: v for k, v in episode.items() if k not in HEAVY_FIELDS}
 
 
-def episode_status(episode: dict) -> str:
+# 앞에 있는 키를 먼저 쓴다 — decompose→PR, predict→success, plan→CR.
+LABEL_PRIORITY = ("PR", "success", "CR")
 
+
+def episode_status(episode: dict) -> tuple[str | None, str | None]:
+    """(status, 판정에 쓴 키). 판정 불가면 (None, None).
+
+    PR 을 먼저 보는 이유: decompose 의 CR 은 봇이 서브골을 추가해서라도 완주하면
+    1 이라 "성공" 안에 LLM 분해가 불완전한 궤적이 섞인다 (GoTo 에서 CR 91% vs
+    PR 15%). PR 은 봇 추가 0회만 성공으로 친다.
+
+    eval_error 가 있는 궤적은 호출부에서 이미 걸렀다고 가정한다. CR·ACI 등
+    나머지 지표는 meta 의 eval_result 에 그대로 남으므로 나중에 재분류할 수 있다.
+    """
     r = episode.get("eval_result") or {}
-    if "success" in r:
-        return "success" if r["success"] else "failure"
-    if "CR" in r:
-        return "success" if r["CR"] == 1 else "failure"
-    if episode.get("eval_error") is not None:
-        return "failure"
-    raise ValueError(f"cannot determine status from eval_result: {r!r}")
+    for key in LABEL_PRIORITY:
+        if key in r:
+            ok = bool(r[key]) if key == "success" else r[key] == 1
+            return ("success" if ok else "failure"), key
+    return None, None
 
 
 # ------------------------------------------------------------------------- run
@@ -239,7 +253,8 @@ def extract_run(
             return
         out_path = run_dir / status / f"chunk_{chunk_idx[status]:04d}.pt"
         torch.save({"episodes": buffers[status], "model": MODEL,
-                    "boundary_layout": "prompt|steps|terminal"}, out_path)
+                    "boundary_layout": "prompt|steps|terminal",
+                    "label_priority": LABEL_PRIORITY}, out_path)
         buffers[status] = {}
         chunk_idx[status] += 1
 
@@ -263,17 +278,32 @@ def extract_run(
                 skip(meta, "no_output")
                 continue
 
-            status = episode_status(episode)
-            meta["status"] = status
+            if episode.get("truncated"):             # max_tokens 에서 잘림 → 마지막 구간 불완전
+                skip(meta, "truncated")
+                continue
+
+            if episode.get("eval_error") is not None:
+                # 파싱 실패 / 봇 실행 예외 / eval 타임아웃이 한 필드에 섞여 있다.
+                # 타임아웃은 봇 리플랜 루프가 안 끝나는 환경 문제라 LLM 실패가
+                # 아니고, 파싱 실패는 어차피 step_char_bounds 가 거른다. 통째로 뺀다.
+                skip(meta, "eval_error")
+                continue
 
             if not (episode.get("prompt") or "").strip():
                 skip(meta, "empty_prompt")           # 프롬프트 구간이 길이 0이 된다
                 continue
 
+            status, label_key = episode_status(episode)
+            if status is None:
+                skip(meta, "no_label")               # eval_result 에 판정 키가 없다
+                continue
+            meta["status"] = status
+            meta["label_key"] = label_key
+
             # 구조 검사는 토크나이즈 전에 — 안 맞는 궤적엔 모델을 안 태운다
             char_bounds, reason = step_char_bounds(episode["all_llm_output"], task)
             meta["output_sha1"] = hashlib.sha1(
-                episode["all_llm_output"].encode()).hexdigest()
+                (episode["all_llm_output"] or "").encode()).hexdigest()
             if reason is not None:
                 skip(meta, reason)
                 continue
@@ -319,7 +349,10 @@ def extract_run(
     for status in buffers:
         flush(status)
 
+    n_success = sum(1 for s in seen_seeds["success"] for _ in (0,))
     print(f"saved {n_saved} episodes under {run_dir} ({n_skipped} skipped)")
+    print(f"  success {len(seen_seeds['success'])} / failure {len(seen_seeds['failure'])}"
+          f"  [label_priority={LABEL_PRIORITY}]")
     for reason, n in reasons.most_common():
         print(f"  skipped {reason}: {n}")
 
