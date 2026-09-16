@@ -48,7 +48,7 @@ from runner.env_loader import make_env
 from formatters import get_formatter
 from prompters import get_prompter
 from evaluators import get_evaluator
-from llms.utils import parser
+from decompose_parser import parse_decompose_output   # llms.utils.parser 는 '<START>  \n' 을 못 읽음
 
 TASK = "decompose"
 FORMATTER, PROMPTER = "structured", "cot"
@@ -252,7 +252,7 @@ def main():
                     outputs = llm.generate(texts, sp)
                     for seed, mission, prompt, o in zip(batch, missions, prompts, outputs):
                         text = o.outputs[0].text.strip()
-                        pred = parser(text, TASK)   # <START>..<END> 사이
+                        pred = parse_decompose_output(text)   # <START>..<END> 사이
                         # Decompose evaluator 는 (env_name, seed) 가 아니라 살아있는
                         # env 객체를 받음 — eval 시점에 새로 만든다.
                         env = None

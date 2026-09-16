@@ -218,6 +218,74 @@ def load_episodes(path: Path) -> list[dict]:
     return episodes
 
 
+def process_episode(episode: dict, task: str, src_name: str) -> tuple[dict, dict | None]:
+    """에피소드 하나: skip 판정 → 라벨 → 경계 → 토크나이즈 → hidden state.
+
+    반환 (meta, payload). payload 가 None 이면 skip 이고 사유는 meta["extract_skipped"].
+    payload 는 청크에 들어가는 dict — {"E", "boundaries", "output_sha1"}.
+    extract_run 과 script/resume_extract.py 가 같이 쓴다 (한 곳만 고치면 되게)."""
+    meta = build_meta(episode)
+    meta["src"] = src_name
+
+    def skip(reason):
+        meta["extract_skipped"] = reason
+        return meta, None
+
+    if episode.get("skipped"):               # 출력 자체가 없는 에피소드
+        return skip("no_output")
+    if episode.get("truncated"):             # max_tokens 에서 잘림 → 마지막 구간 불완전
+        return skip("truncated")
+    if episode.get("eval_error") is not None:
+        # 파싱 실패 / 봇 실행 예외 / eval 타임아웃이 한 필드에 섞여 있다.
+        # 타임아웃은 봇 리플랜 루프가 안 끝나는 환경 문제라 LLM 실패가
+        # 아니고, 파싱 실패는 어차피 step_char_bounds 가 거른다. 통째로 뺀다.
+        return skip("eval_error")
+    if not (episode.get("prompt") or "").strip():
+        return skip("empty_prompt")          # 프롬프트 구간이 길이 0이 된다
+
+    status, label_key = episode_status(episode)
+    if status is None:
+        return skip("no_label")              # eval_result 에 판정 키가 없다
+    meta["status"] = status
+    meta["label_key"] = label_key
+
+    # 구조 검사는 토크나이즈 전에 — 안 맞는 궤적엔 모델을 안 태운다
+    char_bounds, reason = step_char_bounds(episode["all_llm_output"], task)
+    meta["output_sha1"] = hashlib.sha1(
+        (episode["all_llm_output"] or "").encode()).hexdigest()
+    if reason is not None:
+        return skip(reason)
+
+    ids, boundaries, reason = tokenize_episode(episode, char_bounds)
+    if reason is not None:
+        return skip(reason)
+    meta.update(
+        n_tokens_total=len(ids),
+        n_tokens_prompt=boundaries[1],
+        n_tokens_output=boundaries[-1] - boundaries[1],
+        n_tokens_terminal=boundaries[-1] - boundaries[-2],
+        n_steps=len(boundaries) - 3,         # 프롬프트·터미널 제외
+    )
+
+    if any(a >= b for a, b in zip(boundaries, boundaries[1:])):
+        return skip("empty_token_segment")   # 문자로는 갈렸는데 토큰으로 뭉개진 구간
+    if len(ids) > MAX_TOKENS:
+        return skip("too_long")
+
+    E = extract_hidden(ids)
+    assert E.shape[0] == boundaries[-1]
+    return meta, {
+        "E": E,                          # (프롬프트+출력 토큰수) x d
+        "boundaries": boundaries,        # [0, prompt, step1..N, terminal 끝]
+        "output_sha1": meta["output_sha1"],
+    }
+
+
+def chunk_header() -> dict:
+    return {"model": MODEL, "boundary_layout": "prompt|steps|terminal",
+            "label_priority": LABEL_PRIORITY}
+
+
 def extract_run(
     data_dir: Path,
     out_root: Path,
@@ -257,9 +325,7 @@ def extract_run(
         if not buffers[status]:
             return
         out_path = run_dir / status / f"chunk_{chunk_idx[status]:04d}.pt"
-        torch.save({"episodes": buffers[status], "model": MODEL,
-                    "boundary_layout": "prompt|steps|terminal",
-                    "label_priority": LABEL_PRIORITY}, out_path)
+        torch.save({"episodes": buffers[status], **chunk_header()}, out_path)
         buffers[status] = {}
         chunk_idx[status] += 1
 
@@ -276,74 +342,17 @@ def extract_run(
             n_skipped += 1
 
         for episode in tqdm(episodes, desc="episodes", unit="episode"):
-            meta = build_meta(episode)
-            meta["src"] = src.name
-
-            if episode.get("skipped"):               # 출력 자체가 없는 에피소드
-                skip(meta, "no_output")
+            meta, payload = process_episode(episode, task, src.name)
+            if payload is None:
+                skip(meta, meta["extract_skipped"])
                 continue
-
-            if episode.get("truncated"):             # max_tokens 에서 잘림 → 마지막 구간 불완전
-                skip(meta, "truncated")
-                continue
-
-            if episode.get("eval_error") is not None:
-                # 파싱 실패 / 봇 실행 예외 / eval 타임아웃이 한 필드에 섞여 있다.
-                # 타임아웃은 봇 리플랜 루프가 안 끝나는 환경 문제라 LLM 실패가
-                # 아니고, 파싱 실패는 어차피 step_char_bounds 가 거른다. 통째로 뺀다.
-                skip(meta, "eval_error")
-                continue
-
-            if not (episode.get("prompt") or "").strip():
-                skip(meta, "empty_prompt")           # 프롬프트 구간이 길이 0이 된다
-                continue
-
-            status, label_key = episode_status(episode)
-            if status is None:
-                skip(meta, "no_label")               # eval_result 에 판정 키가 없다
-                continue
-            meta["status"] = status
-            meta["label_key"] = label_key
-
-            # 구조 검사는 토크나이즈 전에 — 안 맞는 궤적엔 모델을 안 태운다
-            char_bounds, reason = step_char_bounds(episode["all_llm_output"], task)
-            meta["output_sha1"] = hashlib.sha1(
-                (episode["all_llm_output"] or "").encode()).hexdigest()
-            if reason is not None:
-                skip(meta, reason)
-                continue
-
-            ids, boundaries, reason = tokenize_episode(episode, char_bounds)
-            if reason is not None:
-                skip(meta, reason)
-                continue
-            meta.update(
-                n_tokens_total=len(ids),
-                n_tokens_prompt=boundaries[1],
-                n_tokens_output=boundaries[-1] - boundaries[1],
-                n_tokens_terminal=boundaries[-1] - boundaries[-2],
-                n_steps=len(boundaries) - 3,         # 프롬프트·터미널 제외
-            )
-
-            if any(a >= b for a, b in zip(boundaries, boundaries[1:])):
-                skip(meta, "empty_token_segment")    # 문자로는 갈렸는데 토큰으로 뭉개진 구간
-                continue
-            if len(ids) > MAX_TOKENS:
-                skip(meta, "too_long")
-                continue
-
-            E = extract_hidden(ids)
-            assert E.shape[0] == boundaries[-1]
+            status = meta["status"]
 
             seed = episode["env_seed"]
             if seed in seen_seeds[status]:
                 raise ValueError(f"id collision: {task}/{level}/{status} seed={seed}")
             seen_seeds[status].add(seed)
-            buffers[status][seed] = {
-                "E": E,                          # (프롬프트+출력 토큰수) x d
-                "boundaries": boundaries,        # [0, prompt, step1..N, terminal 끝]
-                "output_sha1": meta["output_sha1"],
-            }
+            buffers[status][seed] = payload
             meta["chunk"] = chunk_idx[status]        # 이 episode가 들어갈 청크 파일 인덱스
             mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
             n_saved += 1
