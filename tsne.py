@@ -69,9 +69,11 @@ def main():
                     help="구간 마지막 토큰에서 몇 칸 앞 (probing.py 와 같은 의미)")
     ap.add_argument("--with-prompt", action="store_true",
                     help="프롬프트 구간 마지막 토큰도 포함")
+    ap.add_argument("--n-steps", type=int, default=None,
+                    help="이 step 수인 에피소드만 사용 (decompose=6, plan=5)")
     ap.add_argument("--max-episodes", type=int, default=2000,
                     help="t-SNE 에 넣을 에피소드 수. None 이면 전부")
-    ap.add_argument("--pca", type=int, default=0,
+    ap.add_argument("--pca", type=int, default=50,
                     help="t-SNE 전에 줄일 차원. 0 이면 PCA 생략 (논문은 생략)")
     ap.add_argument("--perplexity", type=float, default=30.0)
     ap.add_argument("--seed", type=int, default=42)
@@ -81,7 +83,7 @@ def main():
 
     a.output.mkdir(parents=True, exist_ok=True)
 
-    data = load_pt(a.pt, a.offset, a.with_prompt)
+    data = load_pt(a.pt, a.offset, a.with_prompt, a.n_steps)
     data, n_ep = subsample_by_episode(data, a.max_episodes, a.seed)
     X, labels = data["X"], data["step_num"]
     print(f"t-SNE 입력: {X.shape}  에피소드 {n_ep}개  "
