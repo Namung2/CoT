@@ -1,16 +1,19 @@
 """토큰마다 스텝 시작점에서 리셋되는 누적 그람(SVD) 임베딩 → 토큰x토큰 히트맵.
 
-5-1(spectral.py, 스텝당 그람 1개)과 다르게, 토큰이 하나 생성될 때마다 "현재
-스텝의 첫 토큰부터 지금 토큰까지"만 다시 누적해서 그람을 계산한다 (에피소드
-전체 누적이 아니라 스텝 경계에서 리셋). 그러니 각 스텝의 "마지막 토큰" 시점만
-뽑으면 5-1의 스텝당 e_t와 정확히 같아야 한다 — spectral_states가 있으면 그것과
+5-1(spectral.py, 구간당 그람 1개)과 다르게, 토큰이 하나 생성될 때마다 "현재
+구간의 첫 토큰부터 지금 토큰까지"만 다시 누적해서 그람을 계산한다 (에피소드
+전체 누적이 아니라 구간 경계에서 리셋). 그러니 각 구간의 "마지막 토큰" 시점만
+뽑으면 5-1의 구간당 e_t와 정확히 같아야 한다 — spectral_states가 있으면 그것과
 비교해서 검증까지 한다.
 
+구간은 extract.gen_view 기준이다. 프롬프트는 빼고 step 1..N + 터미널(정답 문장).
+프롬프트 토큰이 전체의 2/3 라 넣으면 관심 구간이 구석으로 밀린다.
+
 step_similarity.py(레벨 전체 평균)와 다르게 episode 하나를 골라서 그 안의
-토큰x토큰 유사도 행렬을 그린다 (옛날 팀원 방식과 동일 — success/fail 예시
-하나씩 뽑아보는 용도).
+토큰x토큰 유사도 행렬을 그린다 (success/fail 예시 하나씩 뽑아보는 용도).
 
     python visual/heatmap.py --task decompose --level BabyAI-GoToObj-v0 --status success --seed 5
+    python visual/heatmap.py --task decompose --level BabyAI-GoToObj-v0 --status success --rep raw
 """
 from __future__ import annotations
 
@@ -23,16 +26,16 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
-from extract import load_chunk                                          # noqa: E402
+from extract import load_chunk, gen_view, seg_labels                    # noqa: E402
 from spectral import spectral_embedding, make_tag, DEVICE, K_EIG, SCALE, SIGN_MODE, SIGN_MODES  # noqa: E402
 
 
 @torch.no_grad()
 def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
                            k: int, scale: bool, sign_mode: str):
-    """토큰마다 e_i 계산 (스텝 시작점부터 그 토큰까지 누적, 스텝 바뀌면 리셋).
+    """토큰마다 e_i 계산 (구간 시작점부터 그 토큰까지 누적, 구간 바뀌면 리셋).
 
-    반환: e_all (N x kd), last_of_step ({스텝: 그 스텝 마지막 토큰의 e_i}) —
+    반환: e_all (N x kd), last_of_step ({구간: 그 구간 마지막 토큰의 e_i}) —
     후자는 5-1의 e_t와 동일해야 함(같은 슬라이스라 정의상 동일).
     """
     e_list, last_of_step = [], {}
@@ -45,7 +48,7 @@ def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
 
 
 def verify_against_spectral_states(last_of_step: dict, spectral_e: dict, atol: float = 1e-4):
-    """spectral_states의 e_t(5-1)와 각 스텝 마지막 토큰의 e_i(5-2)가 실제로
+    """spectral_states의 e_t(5-1)와 각 구간 마지막 토큰의 e_i(5-2)가 실제로
     같은지 확인. 다르면 구현 버그."""
     for t, e_5_2 in last_of_step.items():
         if e_5_2 is None or t not in spectral_e:
@@ -53,7 +56,7 @@ def verify_against_spectral_states(last_of_step: dict, spectral_e: dict, atol: f
         e_5_1 = spectral_e[t]
         if not torch.allclose(e_5_1, e_5_2, atol=atol):
             diff = (e_5_1 - e_5_2).abs().max().item()
-            raise AssertionError(f"step {t}: 5-1과 5-2 마지막 토큰 불일치 (max diff={diff})")
+            raise AssertionError(f"segment {t}: 5-1과 5-2 마지막 토큰 불일치 (max diff={diff})")
     return True
 
 
@@ -62,25 +65,24 @@ def heatmap_matrix(e_all: torch.Tensor) -> torch.Tensor:
     return un @ un.T
 
 
-def plot_heatmap(sim: torch.Tensor, boundaries: list[int], out_path: Path, title: str):
+def plot_heatmap(sim: torch.Tensor, seg: list[int], out_path: Path, title: str):
     import matplotlib.pyplot as plt
-
     import matplotlib.patches as patches
 
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(sim.numpy(), cmap="viridis", vmin=-1, vmax=1)
     fig.colorbar(im, ax=ax, label="cosine similarity")
 
-    # 스텝 경계 — 옅은 선 대신 각 스텝의 대각 블록(intra-step 영역) 자체를 빨간
-    # 사각형 테두리로 명시 (미팅 피드백: "옅은 흰 선으로는 부족, 사각형/라벨로")
-    for s, e in zip(boundaries, boundaries[1:]):
+    # 구간 경계 — 옅은 선 대신 각 구간의 대각 블록(intra-segment 영역) 자체를
+    # 빨간 사각형 테두리로 명시 (미팅 피드백: "옅은 흰 선으로는 부족, 사각형/라벨로")
+    for s, e in zip(seg, seg[1:]):
         n = e - s
         rect = patches.Rectangle((s - 0.5, s - 0.5), n, n,
                                  linewidth=1.5, edgecolor="red", facecolor="none")
         ax.add_patch(rect)
 
-    mids = [(s + e) / 2 - 0.5 for s, e in zip(boundaries, boundaries[1:])]
-    labels = [f"Step {t}" for t in range(len(boundaries) - 1)]
+    mids = [(s + e) / 2 - 0.5 for s, e in zip(seg, seg[1:])]
+    labels = seg_labels(seg)
     ax.set_xticks(mids); ax.set_xticklabels(labels, rotation=90, fontsize=7)
     ax.set_yticks(mids); ax.set_yticklabels(labels, fontsize=7)
     ax.set_title(title, fontsize=9)
@@ -90,10 +92,9 @@ def plot_heatmap(sim: torch.Tensor, boundaries: list[int], out_path: Path, title
 
 
 def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None = None,
-        ctx_tag: str = "with_prompt",
         k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
         spectral_dir: Path | None = None, rep: str = "spectral"):
-    h_dir = hidden_dir / task / level / ctx_tag / status
+    h_dir = hidden_dir / task / level / status
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not chunk_files:
         raise FileNotFoundError(f"no chunk_*.pt in {h_dir}")
@@ -111,18 +112,17 @@ def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None =
     if episode is None:
         raise KeyError(f"seed {seed} not found under {h_dir}")
 
-    E, boundaries = episode["E"], episode["boundaries"]
+    E, seg = gen_view(episode)      # 프롬프트 제외, step 1..N + 터미널
 
     if rep == "raw":
         # spectral 을 안 거친 원본 토큰 벡터(5120) 끼리의 코사인. 누적도 리셋도 없다.
-        sim = heatmap_matrix(E.float())
-        return sim, boundaries, seed
+        return heatmap_matrix(E.float()), seg, seed
 
-    e_all, last_of_step = cumulative_within_step(E, boundaries, k, scale, sign_mode)
+    e_all, last_of_step = cumulative_within_step(E, seg, k, scale, sign_mode)
 
     if spectral_dir is not None:
         spectral_tag = make_tag(k, scale, sign_mode)   # spectral.py 와 같은 규칙으로 디렉토리명 생성
-        s_path = spectral_dir / task / level / ctx_tag / status / spectral_tag / chunk_name
+        s_path = spectral_dir / task / level / status / spectral_tag / chunk_name
         if s_path.exists():
             spectral_e = torch.load(s_path, map_location="cpu", weights_only=False)
             spectral_e = spectral_e["episodes"][seed]["e"]
@@ -131,8 +131,7 @@ def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None =
             print(f"warning: {s_path} 없음 — 5-1 vs 5-2 검증 건너뜀 "
                   f"(같은 k/scale/sign_mode 로 spectral 을 먼저 돌렸는지 확인)", file=sys.stderr)
 
-    sim = heatmap_matrix(e_all)
-    return sim, boundaries, seed
+    return heatmap_matrix(e_all), seg, seed
 
 
 def main():
@@ -152,10 +151,10 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "heatmap")
     args = ap.parse_args()
 
-    sim, boundaries, seed = run(args.hidden_dir, args.task, args.level, args.status,
-                               seed=args.seed, k=args.k,
-                               sign_mode=args.sign_mode, spectral_dir=args.spectral_dir,
-                               rep=args.rep)
+    sim, seg, seed = run(args.hidden_dir, args.task, args.level, args.status,
+                         seed=args.seed, k=args.k,
+                         sign_mode=args.sign_mode, spectral_dir=args.spectral_dir,
+                         rep=args.rep)
 
     # raw 는 k/부호와 무관하므로 raw/<status>/ 로 따로 둔다.
     if args.rep == "raw":
@@ -168,10 +167,11 @@ def main():
         out_dir = args.out_dir / f"k{args.k}" / args.status / args.sign_mode
     out_dir.mkdir(parents=True, exist_ok=True)
     name = f"{args.task}_{args.level}_{args.status}_{seed}_{tag}"
-    plot_heatmap(sim, boundaries, out_dir / f"{name}.png",
-                title=f"{args.task}/{args.level}/{args.status} seed={seed} "
-                      f"(n_tok={sim.shape[0]})\n{tag}")
-    print(f"n_tokens={sim.shape[0]} n_steps={len(boundaries) - 1}")
+    plot_heatmap(sim, seg, out_dir / f"{name}.png",
+                 title=f"{args.task}/{args.level}/{args.status} seed={seed} "
+                       f"(n_tok={sim.shape[0]}, prompt 제외)\n{tag}")
+    print(f"n_tokens={sim.shape[0]} n_segments={len(seg) - 1} "
+          f"(steps={len(seg) - 2} + answer)")
     print(f"saved -> {out_dir / name}.png")
 
 

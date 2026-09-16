@@ -379,3 +379,32 @@ def load_step_views(episode: dict) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """스텝 구간만 — 프롬프트(첫 구간)와 터미널(마지막 구간)은 뺀다."""
     E, b = episode["E"], episode["boundaries"]
     return E, [E[s:e] for s, e in zip(b[1:-2], b[2:-1])]
+
+
+def gen_view(episode: dict) -> tuple[torch.Tensor, list[int]]:
+    """프롬프트를 뺀 생성 구간. 반환 (E_gen, seg).
+
+        seg = [0, step1 끝, ..., stepN 끝, 전체 끝]   — 0 기준으로 재정렬한 경계
+        구간 = [step 1]...[step N][터미널]            — N+1 개
+
+    프롬프트는 생성 시점 문맥으로만 필요했고 분석 대상이 아니다. 여기 있는 토큰이
+    전체의 2/3 라 (플랜 프롬프트 ~1000토큰 vs 출력 ~500토큰) 히트맵·GSBS 에 그대로
+    넣으면 실제 관심 구간이 구석으로 밀린다.
+
+    heatmap.py / gsbs.py / spectral.py 가 전부 이 함수를 써야 세 결과의 좌표가
+    맞물린다 — 각자 boundaries 를 손으로 자르면 조용히 어긋난다.
+    """
+    E, b = episode["E"], episode["boundaries"]
+    gen0 = b[1]                                   # 프롬프트 끝 = 생성 구간 시작
+    return E[gen0:], [x - gen0 for x in b[1:]]
+
+
+def gen_views(episode: dict) -> tuple[torch.Tensor, list[int], list[torch.Tensor]]:
+    """gen_view 를 구간 리스트까지 잘라서 돌려준다. (E_gen, seg, views)"""
+    E, seg = gen_view(episode)
+    return E, seg, [E[s:e] for s, e in zip(seg, seg[1:])]
+
+
+def seg_labels(seg: list[int]) -> list[str]:
+    """gen_view 의 seg 에 대응하는 구간 이름. ["Step 1", ..., "Step N", "answer"]"""
+    return [f"Step {t}" for t in range(1, len(seg) - 1)] + ["answer"]

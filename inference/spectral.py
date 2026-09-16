@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from extract import MODEL, load_chunk, load_step_views
+from extract import MODEL, load_chunk, gen_views
 
 K_EIG = 8
 SCALE = True        # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
@@ -101,9 +101,9 @@ def episode_embeddings(views: list[torch.Tensor], k: int, scale: bool, sign_mode
     return e, lam, V, sc
 
 
-def load_hidden_states(data_dir: Path, task: str, level: str,
-                       status: str, ctx_tag: str = "with_prompt"):
-    target = data_dir / task / level / ctx_tag / status
+def load_hidden_states(data_dir: Path, task: str, level: str, status: str):
+    """extract.py 출력 경로: <data_dir>/<task>/<level>/<status>/chunk_*.pt"""
+    target = data_dir / task / level / status
     if not target.is_dir():
         raise FileNotFoundError(f"no such directory: {target}")
 
@@ -116,24 +116,29 @@ def load_hidden_states(data_dir: Path, task: str, level: str,
 @torch.no_grad()
 def spectral_run(data_root: Path, out_root: Path, task: str, level: str,
                  status: str, k: int = K_EIG, scale: bool = SCALE,
-                 sign_mode: str = SIGN_MODE, ctx_tag: str = "with_prompt"):
+                 sign_mode: str = SIGN_MODE):
+    """구간별 spectral embedding 을 만든다.
 
+    gen_views 를 쓰므로 프롬프트는 빠지고 step 1..N + 터미널(정답 문장)이 들어간다.
+    딕셔너리 키 0..N-1 이 step 1..N, 키 N 이 터미널이다 (extract.seg_labels 와 동일).
+    heatmap.py / gsbs.py 도 같은 gen_views 를 쓰므로 세 결과의 구간 인덱스가 맞물린다.
+    """
     data_root = data_root.resolve()
-    chunk_files = load_hidden_states(data_root, task, level, status, ctx_tag)
+    chunk_files = load_hidden_states(data_root, task, level, status)
 
     tag = make_tag(k, scale, sign_mode)
     rel = Path(task) / level
-    out_dir = out_root / rel / ctx_tag / status / tag
+    out_dir = out_root / rel / status / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("chunk_*.pt"):   # hidden_states 청크 개수가 줄었을 때 낡은 파일 안 남게
         old.unlink()
 
     n_episodes = 0
-    for cf in tqdm(chunk_files, desc=f"{rel}/{tag}", unit="chunk"):
+    for cf in tqdm(chunk_files, desc=f"{rel}/{status}/{tag}", unit="chunk"):
         chunk = load_chunk(cf)
         out = {}
         for seed, episode in chunk.items():
-            _, views = load_step_views(episode)
+            _, _, views = gen_views(episode)
             e, lam, V, sc = episode_embeddings(views, k, scale, sign_mode)
             rec = {"e": e, "eigvals": lam, "V": V}
             if sc:
