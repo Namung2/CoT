@@ -225,6 +225,7 @@ def extract_run(
     level: str,
     mode: str = "no_thinking",
     chunk: int = 256,
+    limit: int | None = None,
 ):
 
     src = data_dir / f"{task}_{mode}.jsonl"
@@ -235,6 +236,10 @@ def extract_run(
     if not episodes:
         raise ValueError(f"no episodes with task == {task!r} and env_name == {level!r} "
                          f"in {src} ({len(all_episodes)} loaded total)")
+
+    if limit is not None:        # smoke test — skip 사유 분포와 청크 크기만 보고 끊는다
+        episodes = episodes[:limit]
+        print(f"limit={limit} (of {len(all_episodes)} loaded)")
 
     run_dir = out_root / task / level
     for status in ("success", "failure"):
