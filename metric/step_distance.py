@@ -32,6 +32,7 @@ import statistics
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -133,6 +134,15 @@ def status_dir(hidden_dir: Path, task: str, level: str, status: str) -> Path:
     return d
 
 
+def load_blob(cf: Path) -> dict:
+    """청크 하나가 ~4 GB(256 ep × ~1500 tok × 5120 × bf16)인데 쓰는 건 episode 당 N+1 행뿐이라
+    mmap 으로 열어 인덱싱한 행만 디스크에서 읽는다. (구형 저장 포맷이면 일반 로드로 폴백.)"""
+    try:
+        return torch.load(cf, map_location="cpu", weights_only=False, mmap=True)
+    except (RuntimeError, TypeError, ValueError):
+        return torch.load(cf, map_location="cpu", weights_only=False)
+
+
 def run(hidden_dir: Path, task: str, level: str, max_episodes: int | None = None) -> dict:
     rows: dict[str, list[dict]] = {"success": [], "fail": []}
     stats = {"n_seen": 0, "n_bad_boundaries": 0, "layout": None, "label_priority": None}
@@ -140,8 +150,8 @@ def run(hidden_dir: Path, task: str, level: str, max_episodes: int | None = None
     for status, lab in LABELS.items():
         d = status_dir(hidden_dir, task, level, status)
         done = False
-        for cf in sorted(d.glob("chunk_*.pt")):
-            blob = torch.load(cf, map_location="cpu", weights_only=False)
+        for cf in tqdm(sorted(d.glob("chunk_*.pt")), desc=f"{task}/{level}/{status}", unit="chunk"):
+            blob = load_blob(cf)
             layout = blob.get("boundary_layout")
             if layout != LAYOUT:
                 raise ValueError(f"{cf}: boundary_layout={layout!r}, expected {LAYOUT!r} — "
