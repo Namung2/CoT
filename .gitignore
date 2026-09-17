@@ -7,7 +7,7 @@ key.txt
 __pycache__/
 *.pyc
 .pytest_cache/
-
+*.pkl
 # data & artifacts
 data/
 latent/
@@ -31,3 +31,6 @@ wandb/
 *.out
 .claude/
 .gitignore
+
+third_party/*
+*.bak

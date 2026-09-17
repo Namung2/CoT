@@ -1,0 +1,122 @@
+{
+  "prompt": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_1": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9998734177215189,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9994939271255061,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_2": {
+    "test_auc": {
+      "mean": 0.999999597134159,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9998101265822785,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9992410827219833,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_3": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9998734177215189,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9994939271255061,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_4": {
+    "test_auc": {
+      "mean": 0.999999597134159,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9998734177215189,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.999493670886076,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_5": {
+    "test_auc": {
+      "mean": 0.9999993407649873,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9996835443037975,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9987351378699721,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_6": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "answer": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  }
+}

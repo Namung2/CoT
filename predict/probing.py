@@ -99,7 +99,7 @@ def load_pt(patterns, offset, with_prompt=False, n_steps=None):
                 if i < start:
                     stats["segment_too_short"] += 1
                     return
-                Xs.append(E[i]); Ns.append(label); Gs.append(gid)
+                Xs.append(E[i].copy()); Ns.append(label); Gs.append(gid)   # view 면 E 전체가 살아남아 300GB 까지 감
 
             if with_prompt:
                 take(b[0], b[1], PROMPT_LABEL)
