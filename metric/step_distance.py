@@ -40,7 +40,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
-from extract import (MODEL, load_chunk, load_episodes,            # noqa: E402
+from extract import (MODEL, load_episodes,                        # noqa: E402
                      step_char_bounds, char_to_token_bounds)
 
 TRANSITIONS = ("first", "second_last_to_last", "last_to_answer")
@@ -193,8 +193,30 @@ def format_table(table: dict, title: str) -> str:
 
 # ------------------------------------------------------------------ 실행
 
+def resolve_status_dir(hidden_dir: Path, task: str, level: str, status: str, ctx_tag: str) -> Path:
+    """현재 extract.py 레이아웃(task/level/<ctx_tag>/status)과 서버의 옛 레이아웃(task/level/status)
+    둘 다 받는다. ctx_tag 를 빈 문자열로 주면 옛 레이아웃만 본다."""
+    cands = []
+    if ctx_tag:
+        cands.append(hidden_dir / task / level / ctx_tag / status)
+    cands.append(hidden_dir / task / level / status)
+    for d in cands:
+        if any(d.glob("chunk_*.pt")):
+            return d
+    raise FileNotFoundError("no chunk_*.pt in any of: " + ", ".join(map(str, cands)))
+
+
+def resolve_data_file(data_dir: Path, task: str, mode: str) -> Path:
+    """generation/trajectory/ (현재 기본값) 에 없으면 옛 위치 data/ 도 본다."""
+    cands = [data_dir / f"{task}_{mode}.jsonl", ROOT / "data" / f"{task}_{mode}.jsonl"]
+    for f in cands:
+        if f.is_file():
+            return f
+    raise FileNotFoundError("no jsonl in any of: " + ", ".join(map(str, cands)))
+
+
 def load_text_index(data_dir: Path, task: str, level: str, mode: str) -> dict[int, dict]:
-    eps = load_episodes(data_dir / f"{task}_{mode}.jsonl")
+    eps = load_episodes(resolve_data_file(data_dir, task, mode))
     return {e["env_seed"]: e for e in eps
             if e.get("task") == task and e.get("env_name") == level and not e.get("skipped")}
 
@@ -212,14 +234,22 @@ def run(hidden_dir: Path, data_dir: Path, task: str, level: str, mode: str = "no
     stats = {"n_seen": 0, "n_missing_text": 0, "n_sha_mismatch": 0,
              "n_boundary_mismatch": 0, "n_preamble": 0,
              "ans_reason": {"ok": 0, "no_marker": 0, "not_in_last_step": 0, "too_few_steps": 0}}
+    use_prompt = None   # 청크 헤더(use_prompt_context)에서 읽음. 없으면 ctx_tag 로 추정
     for status, lab in LABELS.items():
-        d = hidden_dir / task / level / ctx_tag / status
+        d = resolve_status_dir(hidden_dir, task, level, status, ctx_tag)
         files = sorted(d.glob("chunk_*.pt"))
-        if not files:
-            raise FileNotFoundError(f"no chunk_*.pt in {d}")
         done = False
         for cf in files:
-            for seed, ep in load_chunk(cf).items():
+            blob = torch.load(cf, map_location="cpu", weights_only=False)
+            hdr = blob.get("use_prompt_context")
+            if use_prompt is None:
+                # 헤더가 있으면 그 값, 없으면(옛 청크) --ctx-tag 로 결정. boundaries/idx_ans 는
+                # 출력 기준(ctx 만큼 shift)이라 프롬프트 포함 여부는 프롬프트/출력 경계에서 토큰이
+                # 합쳐지는 경우에만 영향을 주고, 그 경우는 n_boundary_mismatch 로 드러난다.
+                use_prompt = bool(hdr) if hdr is not None else (ctx_tag == "with_prompt")
+                stats["use_prompt_context"] = use_prompt
+                stats["hidden_dir_used"] = str(d.parent)
+            for seed, ep in blob["episodes"].items():
                 stats["n_seen"] += 1
                 src = texts.get(seed)
                 if src is None:
@@ -229,8 +259,7 @@ def run(hidden_dir: Path, data_dir: Path, task: str, level: str, mode: str = "no
                 if ep.get("output_sha1") and hashlib.sha1(out.encode()).hexdigest() != ep["output_sha1"]:
                     stats["n_sha_mismatch"] += 1
                     continue
-                info = episode_token_info(src["prompt"] if ctx_tag == "with_prompt" else "",
-                                          out, task, tok)
+                info = episode_token_info(src["prompt"] if use_prompt else "", out, task, tok)
                 if info["boundaries"] != list(ep["boundaries"]):
                     stats["n_boundary_mismatch"] += 1
                     continue
@@ -263,7 +292,9 @@ def main():
     ap.add_argument("--task", required=True, choices=list(ANSWER_MARKER))
     ap.add_argument("--level", required=True)
     ap.add_argument("--mode", default="no_thinking", choices=["no_thinking", "thinking"])
-    ap.add_argument("--ctx-tag", default="with_prompt")
+    ap.add_argument("--ctx-tag", default="with_prompt",
+                    help="hidden_states/task/level/<ctx_tag>/status. 그 층이 없으면 자동으로 "
+                         "task/level/status(옛 레이아웃)를 본다. 빈 문자열이면 옛 레이아웃만")
     ap.add_argument("--max-episodes", type=int, default=None, help="status 당 최대 episode 수 (빠른 확인용)")
     ap.add_argument("--data-dir", type=Path, default=ROOT / "generation" / "trajectory")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
