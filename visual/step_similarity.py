@@ -27,8 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
 from extract import load_chunk                                      # noqa: E402
-from spectral import (make_tag, segment_last, K_EIG, SCALE, SIGN_MODE, SIGN_MODES,  # noqa: E402
-                      N_FRONT, N_BACK)
+from spectral import make_tag, segment_last, Select, K_EIG, SCALE, SIGN_MODE, SIGN_MODES  # noqa: E402
 
 
 def intra_step_similarity(E: torch.Tensor, boundaries: list[int]) -> dict[int, float]:
@@ -64,11 +63,11 @@ def inter_step_similarity(reps: dict[int, torch.Tensor]) -> dict[int, list[float
 def run(hidden_dir: Path, spectral_dir: Path, task: str, level: str, status: str,
         seed: int | None = None, ctx_tag: str = "with_prompt",
         k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
-        n_front: int = N_FRONT, n_back: int = N_BACK):
+        select: Select = Select()):
     """seed=None이면 레벨 전체 episode를 다 풀링해서 평균(기존 동작).
     seed를 주면 그 episode 하나만 갖고 계산 — 다른 episode랑 안 섞임."""
     h_dir = hidden_dir / task / level / ctx_tag / status
-    s_dir = spectral_dir / task / level / ctx_tag / status / make_tag(k, scale, sign_mode, n_front, n_back)
+    s_dir = spectral_dir / task / level / ctx_tag / status / make_tag(k, scale, sign_mode, select)
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not s_dir.is_dir():
         print(f"warning: {s_dir} 없음 — inter_step_e_t 가 비게 됨 "
@@ -187,8 +186,8 @@ def main():
     ap.add_argument("-k", type=int, default=K_EIG)
     ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
                     help="읽을 spectral 저장본 디렉토리를 정함 (spectral 을 돌린 값과 같게)")
-    ap.add_argument("--n-front", type=int, default=N_FRONT, help="읽을 spectral 저장본의 n_front")
-    ap.add_argument("--n-back", type=int, default=N_BACK, help="읽을 spectral 저장본의 n_back (≥1)")
+    ap.add_argument("--select", type=Select.parse, default=Select(),
+                    help="읽을 spectral 저장본의 저장 위치 태그: f<n_front>_b<n_back> (n_back ≥ 1) 또는 all")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "step_similarity")
@@ -200,8 +199,7 @@ def main():
         name += f"_{args.seed}"
 
     summary = run(args.hidden_dir, args.spectral_dir, args.task, args.level, args.status,
-                 seed=args.seed, k=args.k, sign_mode=args.sign_mode,
-                 n_front=args.n_front, n_back=args.n_back)
+                 seed=args.seed, k=args.k, sign_mode=args.sign_mode, select=args.select)
 
     (args.out_dir / f"{name}.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

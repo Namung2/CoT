@@ -25,10 +25,10 @@ boundaries 규약 (길이 N+3):
 
 입력 종류 (--source). 라벨은 모두 같다: 해당 구간이면 참, 다른 구간이면 거짓.
     hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
-    spectral [2] latent/spectral 저장본의 구간 마지막 e_t (back[t][-1], 구간마다 kd 벡터 하나).
-                 n_back ≥ 1 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
-    edges    [3-5] 같은 저장본의 front/back 전부 (inference/spectral.py --n-front 5 --n-back 5).
-                 구간 안 토큰별 누적 e_i 로, 누적은 구간 시작에서 리셋되고 e_i 하나하나가 샘플이다.
+    spectral [2] latent/spectral 저장본의 구간 마지막 e_t (e[t][-1], 구간마다 kd 벡터 하나).
+                 n_back ≥ 1 이거나 --all 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
+    edges    [3-5] 같은 저장본의 구간 안 토큰별 누적 e_i (inference/spectral.py --n-front 5 --n-back 5).
+                 누적은 구간 시작에서 리셋되고 e_i 하나하나가 샘플이다. --all 로 저장한 파일은 --part both 만 된다.
                  --part both  [3] "Step N" 헤더 토큰을 뺀 앞 5개 + 마지막 5개
                  --part front [4] 헤더를 뺀 앞 5개
                  --part back  [5] 마지막 5개 (맨 끝 하나 = [2] 의 e_t)
@@ -146,7 +146,7 @@ def _config_ok(d, p, k, sign_mode, seen, stats):
 
 
 def load_spectral(patterns, k=None, sign_mode=None):
-    """[2] spectral: 구간 전체를 누적한 e_t = back[t][-1] (구간마다 하나)."""
+    """[2] spectral: 구간 전체를 누적한 e_t = e[t][-1] (구간마다 하나, 마지막 위치가 저장된 구간만)."""
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
     for p in _paths(patterns):
@@ -155,14 +155,14 @@ def load_spectral(patterns, k=None, sign_mode=None):
             continue
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "spectral", seed)
-            n_seg = len(ep["back"])
+            seg, n_seg = ep["seg"], len(ep["e"])
             stats["episodes"] += 1
-            for t in sorted(ep["back"]):
-                B = ep["back"][t]
-                if not len(B):
-                    stats["segment_too_short"] += 1
+            for t in sorted(ep["e"]):
+                ps = ep["pos"][t]
+                if not ps or ps[-1] != seg[t + 1] - seg[t] - 1:      # 마지막 토큰이 저장돼 있어야 e_t
+                    stats["no_last_token"] += 1
                     continue
-                Xs.append(B[-1].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                Xs.append(ep["e"][t][-1].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
@@ -170,10 +170,12 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
     """[3-5] edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
 
     part: both (3) | front (4) | back (5). e_i 하나하나가 샘플이고 라벨은 그 구간.
+    저장본은 위치 pos 와 e 만 갖고 있으므로 front/back 은 헤더의 n_front/n_back 과 marker 로 가른다:
+    front = marker ≤ p < marker+n_front, back = p ≥ n-n_back. --all 저장본은 part both 만 된다.
 
     짧은 구간 제외: 구간 길이 < marker + n_front + n_back 이면 (앞/뒤가 겹치거나 모자람)
     그 구간은 통째로 뺀다 — 양성으로도 음성으로도 안 쓴다. part 와 상관없이 같은 기준이라
-    3/4/5 가 같은 구간 집합 위에서 비교된다. keep_short=True 면 끄고, 겹치는 위치는 한 번만 넣는다.
+    3/4/5 가 같은 구간 집합 위에서 비교된다. keep_short=True 면 끈다 (all 저장본은 해당 없음).
     """
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
@@ -181,26 +183,27 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
         d = torch.load(p, map_location="cpu", weights_only=False)
         if not _config_ok(d, p, k, sign_mode, seen, stats):
             continue
-        n_front, n_back = d.get("n_front", 5), d.get("n_back", 5)
+        n_front, n_back, is_all = d["n_front"], d["n_back"], d.get("all", False)
+        if is_all and part != "both":
+            raise SystemExit(f"--all 로 저장한 파일은 --part both 만 가능 ({p})")
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "edges", seed)
-            n_seg = len(ep["back"])
+            n_seg = len(ep["e"])
             stats["episodes"] += 1
             stats[f"marker_{ep.get('marker_src', 'text')}"] += 1
             seg = ep["seg"]
             for t in range(n_seg):
-                n = seg[t + 1] - seg[t]
-                if n < ep["marker"][t] + n_front + n_back:
+                n, m = seg[t + 1] - seg[t], ep["marker"][t]
+                if not is_all and n < m + n_front + n_back:
                     stats[f"short_{target_name(_seg_label(t, n_seg))}"] += 1
                     if not keep_short:
                         continue
-                rows = {}
-                if part in ("both", "front"):
-                    rows.update(zip(ep["front_pos"][t], ep["front"][t]))
-                if part in ("both", "back"):
-                    rows.update(zip(ep["back_pos"][t], ep["back"][t]))
-                for pos in sorted(rows):
-                    Xs.append(rows[pos].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                for pos, row in zip(ep["pos"][t], ep["e"][t]):
+                    if part == "front" and not (m <= pos < m + n_front):
+                        continue
+                    if part == "back" and pos < n - n_back:
+                        continue
+                    Xs.append(row.float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 

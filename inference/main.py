@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from extract import extract_run
-from spectral import SIGN_MODES, N_FRONT, N_BACK, spectral_run, parse_fallback
+from spectral import SIGN_MODES, DTYPES, Select, ALL, spectral_run, parse_fallback
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -48,11 +48,13 @@ def parse_args():
     p.add_argument("--scale", type=str, nargs="+", default=["true"], choices=["true", "false"])
     p.add_argument("--sign-mode", nargs="+", default=["data"], choices=list(SIGN_MODES),
                    help="고유벡터 부호 보정 방식. 여러 개 주면 각각 따로 저장됨 "
-                        "(spectral/.../k8_scaled_sign-<mode>_f<n_front>_b<n_back>)")
-    p.add_argument("--n-front", type=int, default=N_FRONT,
+                        "(spectral/.../k8_scaled_sign-<mode>_f<n_front>_b<n_back> 또는 _all)")
+    p.add_argument("--n-front", type=int, default=0,
                    help="구간 앞(형식 문구 뒤)에서 저장할 토큰별 e 개수. 0 이면 안 저장")
-    p.add_argument("--n-back", type=int, default=N_BACK,
+    p.add_argument("--n-back", type=int, default=1,
                    help="구간 뒤에서 저장할 토큰별 e 개수. 1 이면 구간 마지막 e_t 만")
+    p.add_argument("--all", action="store_true", help="구간의 모든 토큰 e 를 저장 (--n-front/--n-back 무시)")
+    p.add_argument("--dtype", default="float32", choices=list(DTYPES), help="e 저장 dtype")
     p.add_argument("--fallback-marker", nargs="+", default=[], metavar="TASK=S:T",
                    help="--n-front > 0 인데 원본 jsonl 에서 에피소드를 못 찾을 때 쓸 "
                         "형식 토큰 수 (S=step 헤더, T=터미널 문구, 예: predict=5:7)")
@@ -76,11 +78,12 @@ def main():
 
     configs = [(k, scale, sm) for k in a.k for scale in a.scale for sm in a.sign_mode]
     fallback = parse_fallback(a.fallback_marker)
+    select = ALL if a.all else Select(a.n_front, a.n_back)
     for status in a.status:
         # extract 직후라 항상 다시 만든다 (낡은 청크 파일도 지움)
-        stats = spectral_run(a.hidden_dir, a.spectral_dir, a.task, a.level, status, configs,
-                             n_front=a.n_front, n_back=a.n_back,
-                             traj_dir=a.data_dir, mode=a.mode, fallback=fallback, overwrite=True)
+        stats = spectral_run(a.hidden_dir, a.spectral_dir, a.task, a.level, status, configs, select,
+                             traj_dir=a.data_dir, mode=a.mode, fallback=fallback,
+                             dtype=DTYPES[a.dtype], overwrite=True)
         print(f"{a.task}/{a.level}/{status}: {dict(stats)}")
 
 
