@@ -27,6 +27,7 @@ wandb/
 
 # os
 .DS_Store
+.vscode/
 *.md
 *.out
 .claude/

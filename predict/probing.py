@@ -23,8 +23,28 @@ boundaries 규약 (길이 N+3):
     --with-prompt 를 주면 프롬프트 구간의 마지막 토큰도 "prompt" 클래스로 넣는다.
     (논문의 "Step 1" 이 이 자리. 토큰 종류부터 달라서 거의 항상 분리되므로 기본은 제외)
 
+입력 종류 (--source). 라벨은 모두 같다: 해당 구간이면 참, 다른 구간이면 거짓.
+    hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
+    spectral [2] spectral_states 의 구간 전체 누적 e_t (구간마다 kd 벡터 하나).
+                 프롬프트 구간이 없으므로 --with-prompt/--offset 은 무시된다.
+    edges    [3-5] spectral_edges (`inference/spectral.py edges` 출력) 의 토큰별 누적 e_i.
+                 누적은 구간 시작에서 리셋되고, e_i 하나하나가 샘플이다.
+                 --part both  [3] "Step N" 헤더 토큰을 뺀 앞 5개 + 마지막 5개
+                 --part front [4] 헤더를 뺀 앞 5개
+                 --part back  [5] 마지막 5개 (맨 끝 하나 = [2] 의 e_t)
+                 터미널 구간은 정답 앞 형식 문구("<START>" 등)를 헤더처럼 뺀다.
+                 형식 문구 + 앞 5 + 뒤 5 보다 짧은 구간은 3/4/5 모두에서 뺀다 (--keep-short 로 끔).
+                 --k / --sign-mode 로 spectral 설정을 고른다.
+    --max-step M 은 step M 까지만 probe 한다. --drop-above-max 를 같이 주면 그 뒤 step 은
+    음성 샘플에서도 빠진다.
+    분할은 어느 입력이든 에피소드 단위라 같은 에피소드의 샘플이 train/test 에 섞이지 않는다.
+
 Usage:
     python probing.py --pt 'latent/hidden_states/plan/*/*/chunk_*.pt' --output out/plan_all
+    python probing.py --source spectral \
+        --pt 'latent/spectral_states/*/*/*/k8_scaled_sign-data/chunk_*.pt' --output out/spec_all
+    python probing.py --source edges --part front \
+        --pt 'latent/spectral_edges/*/*/*/k8_scaled_sign-data/chunk_*.pt' --output out/edge_front
     python probing.py --pt 'latent/hidden_states/plan/BabyAI-GoTo-v0/*/chunk_*.pt' \
         --output out/plan_goto --offset 1 --cv
 """
@@ -50,34 +70,34 @@ ANSWER_LABEL = -1         # step_num -1 = 터미널(정답 문장)
 
 # ---------------------------------------------------------------- .pt 로딩
 
-def load_pt(patterns, offset, with_prompt=False, n_steps=None):
-    """구간별 대표 벡터를 모은다.
+SOURCES = ("hidden", "spectral", "edges")
 
-    반환: dict(X, step_num, group) — step_num 은 1..N 이 step, 0 이 프롬프트,
-    -1 이 터미널. 라벨링은 make_binary 가 담당한다.
 
-    n_steps: 지정하면 그 step 수인 에피소드만 쓴다. 프롬프트가 고정 목차를 주지만
-    모델이 가끔 다르게 쓰는데, step 수가 섞이면 step_N probe 의 positive 를 못 내는
-    에피소드가 생겨서 probe 가 "N번째 구간인가"가 아니라 "N step 까지 쓴
-    에피소드인가"를 학습할 여지가 있다.
-    실측: decompose 6 step 99.9% / plan 5 step 99.1%.
-    """
-    Xs, Ns, Gs = [], [], []
-    stats = Counter()
-
+def _paths(patterns):
     paths = sorted(p for pat in patterns for p in glob.glob(pat))
     if not paths:
         raise SystemExit(f"no files: {patterns}")
+    return [Path(p) for p in paths]
 
-    for p in paths:
-        p = Path(p)
-        # .../<task>/<level>/<status>/chunk_XXXX.pt
-        status, level, task = p.parent.name, p.parents[1].name, p.parents[2].name
 
+def _gid(p: Path, source: str, seed) -> str:
+    """hidden: .../<task>/<level>/<status>/chunk.pt
+       spectral/edges: .../<task>/<level>/<status>/<tag>/chunk.pt"""
+    base = p.parent if source == "hidden" else p.parents[1]
+    status, level, task = base.name, base.parent.name, base.parents[1].name
+    return f"{task}/{level}/{status}/{seed}"
+
+
+def load_pt(patterns, offset, with_prompt=False):
+    """[1] hidden_states: 구간 마지막 토큰 E[end-1-offset] 하나."""
+    Xs, Ns, Gs = [], [], []
+    stats = Counter()
+
+    for p in _paths(patterns):
         d = torch.load(p, map_location="cpu", weights_only=False)
 
         for seed, ep in d["episodes"].items():
-            gid = f"{task}/{level}/{status}/{seed}"
+            gid = _gid(p, "hidden", seed)
             E = ep["E"].float().numpy()
             b = [int(x) for x in ep["boundaries"]]
             n_tok = E.shape[0]
@@ -88,9 +108,6 @@ def load_pt(patterns, offset, with_prompt=False, n_steps=None):
                 continue
             if any(x >= y for x, y in zip(b, b[1:])):
                 stats["nonmonotonic_boundaries"] += 1
-                continue
-            if n_steps is not None and len(b) - 3 != n_steps:
-                stats["wrong_n_steps"] += 1
                 continue
             stats["episodes"] += 1
 
@@ -107,9 +124,85 @@ def load_pt(patterns, offset, with_prompt=False, n_steps=None):
                 take(s, e, k)
             take(b[-2], b[-1], ANSWER_LABEL)                              # 터미널
 
-    if not Xs:
-        raise SystemExit("벡터 없음 — boundaries 규약 확인")
+    return _pack(Xs, Ns, Gs, stats)
 
+
+def _seg_label(t: int, n_seg: int) -> int:
+    """gen_view 구간 번호 t (0..N-1 = step 1..N, N = 터미널) → step_num."""
+    return ANSWER_LABEL if t == n_seg - 1 else t + 1
+
+
+def _config_ok(d, p, k, sign_mode, seen, stats):
+    """헤더의 k / sign_mode 로 파일을 거른다. 서로 다른 설정이 섞이면 차원이 달라 멈춘다."""
+    cfg = (d.get("k"), d.get("sign_mode"), d.get("scale"))
+    if (k is not None and cfg[0] != k) or (sign_mode is not None and cfg[1] != sign_mode):
+        stats["file_config_skipped"] += 1
+        return False
+    seen.add(cfg)
+    if len(seen) > 1:
+        raise SystemExit(f"서로 다른 spectral 설정이 섞였다 {sorted(seen, key=str)} — "
+                         f"--k / --sign-mode 로 하나만 고르거나 glob 을 좁힐 것 ({p})")
+    return True
+
+
+def load_spectral(patterns, k=None, sign_mode=None):
+    """[2] spectral_states: 구간 전체를 누적한 e_t (구간마다 하나)."""
+    Xs, Ns, Gs = [], [], []
+    stats, seen = Counter(), set()
+    for p in _paths(patterns):
+        d = torch.load(p, map_location="cpu", weights_only=False)
+        if not _config_ok(d, p, k, sign_mode, seen, stats):
+            continue
+        for seed, ep in d["episodes"].items():
+            gid = _gid(p, "spectral", seed)
+            n_seg = len(ep["e"])
+            stats["episodes"] += 1
+            for t in sorted(ep["e"]):
+                Xs.append(ep["e"][t].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+    return _pack(Xs, Ns, Gs, stats)
+
+
+def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
+    """[3-5] spectral_edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
+
+    part: both (3) | front (4) | back (5). e_i 하나하나가 샘플이고 라벨은 그 구간.
+
+    짧은 구간 제외: 구간 길이 < marker + n_front + n_back 이면 (앞/뒤가 겹치거나 모자람)
+    그 구간은 통째로 뺀다 — 양성으로도 음성으로도 안 쓴다. part 와 상관없이 같은 기준이라
+    3/4/5 가 같은 구간 집합 위에서 비교된다. keep_short=True 면 끄고, 겹치는 위치는 한 번만 넣는다.
+    """
+    Xs, Ns, Gs = [], [], []
+    stats, seen = Counter(), set()
+    for p in _paths(patterns):
+        d = torch.load(p, map_location="cpu", weights_only=False)
+        if not _config_ok(d, p, k, sign_mode, seen, stats):
+            continue
+        n_front, n_back = d.get("n_front", 5), d.get("n_back", 5)
+        for seed, ep in d["episodes"].items():
+            gid = _gid(p, "edges", seed)
+            n_seg = len(ep["back"])
+            stats["episodes"] += 1
+            stats[f"marker_{ep.get('marker_src', 'text')}"] += 1
+            seg = ep["seg"]
+            for t in range(n_seg):
+                n = seg[t + 1] - seg[t]
+                if n < ep["marker"][t] + n_front + n_back:
+                    stats[f"short_{target_name(_seg_label(t, n_seg))}"] += 1
+                    if not keep_short:
+                        continue
+                rows = {}
+                if part in ("both", "front"):
+                    rows.update(zip(ep["front_pos"][t], ep["front"][t]))
+                if part in ("both", "back"):
+                    rows.update(zip(ep["back_pos"][t], ep["back"][t]))
+                for pos in sorted(rows):
+                    Xs.append(rows[pos].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+    return _pack(Xs, Ns, Gs, stats)
+
+
+def _pack(Xs, Ns, Gs, stats):
+    if not Xs:
+        raise SystemExit("벡터 없음 — 입력 경로/규약 확인")
     data = dict(X=np.stack(Xs).astype(np.float32),
                 step_num=np.array(Ns, np.int32),
                 group=np.array(Gs, dtype=object))
@@ -168,16 +261,26 @@ def evaluate(clf, X, y):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pt", nargs="+", required=True, help="chunk_*.pt glob (여러 개 가능)")
+    ap.add_argument("--source", choices=SOURCES, default="hidden",
+                    help="hidden: 구간 마지막 토큰 hidden (1) | spectral: 구간 전체 누적 e_t (2) | "
+                         "edges: 구간 앞/뒤 토큰별 누적 e_i (3-5, --part)")
+    ap.add_argument("--part", choices=("both", "front", "back"), default="both",
+                    help="--source edges 일 때: both=앞5+뒤5 (3), front=헤더 뺀 앞5 (4), back=뒤5 (5)")
+    ap.add_argument("--k", type=int, default=None,
+                    help="spectral/edges: 이 k 인 파일만 쓴다 (기본: glob 이 잡은 그대로)")
+    ap.add_argument("--sign-mode", default=None, choices=("none", "first", "max", "data"),
+                    help="spectral/edges: 이 부호 규칙인 파일만 쓴다")
+    ap.add_argument("--keep-short", action="store_true",
+                    help="edges: marker+앞+뒤 보다 짧은 구간도 넣는다 (기본은 제외)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--offset", type=int, default=0,
                     help="구간 마지막 토큰에서 몇 칸 앞을 대표로 쓸지 (ablation)")
     ap.add_argument("--with-prompt", action="store_true",
                     help="프롬프트 구간 마지막 토큰도 클래스로 포함")
-    ap.add_argument("--n-steps", type=int, default=None,
-                    help="이 step 수인 에피소드만 사용. 모델이 목차를 다르게 쓴 소수를 "
-                         "제외한다 (decompose=6, plan=5)")
     ap.add_argument("--max-step", type=int, default=None,
-                    help="이 번호를 넘는 step 은 probe 대상에서 제외 (negative 로는 남음)")
+                    help="이 번호를 넘는 step 은 probe 대상에서 제외 (기본: negative 로는 남음)")
+    ap.add_argument("--drop-above-max", action="store_true",
+                    help="--max-step 을 넘는 step 샘플을 데이터에서 아예 뺀다 (negative 로도 안 씀)")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456, 789, 1011])
     ap.add_argument("--test-size", type=float, default=0.2)
     ap.add_argument("--no-group-split", action="store_true",
@@ -189,7 +292,16 @@ def main():
     a.output.mkdir(parents=True, exist_ok=True)
     (a.output / "classifiers").mkdir(exist_ok=True)
 
-    data = load_pt(a.pt, a.offset, a.with_prompt, a.n_steps)
+    if a.source == "hidden":
+        data = load_pt(a.pt, a.offset, a.with_prompt)
+    elif a.source == "spectral":
+        data = load_spectral(a.pt, a.k, a.sign_mode)
+    else:
+        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
+    if a.max_step is not None and a.drop_above_max:
+        keep = data["step_num"] <= a.max_step          # answer(-1)·prompt(0) 는 남는다
+        print(f"--drop-above-max: step>{a.max_step} 샘플 {int((~keep).sum())}개 제거")
+        data = {k_: v[keep] for k_, v in data.items()}
     group, scale = not a.no_group_split, not a.no_scale
     if group and len(np.unique(data["group"])) < 2:
         print("[warn] 그룹이 1개뿐 → 행 단위 split 으로 대체")
@@ -204,7 +316,7 @@ def main():
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
     print(f"targets={[target_name(l) for l in labels]} "
-          f"group={group} scale={scale} cv={a.cv} offset={a.offset}")
+          f"source={a.source} part={a.part} group={group} scale={scale} cv={a.cv} offset={a.offset}")
 
     rows = []
     for label in labels:
@@ -266,7 +378,9 @@ def main():
     ax.set_xticklabels(ts)
     ax.set_ylim(0, 1.05)
     ax.legend()
-    ax.set_title(f"Last-layer probes (seeds={len(a.seeds)}, group={group}, offset={a.offset})")
+    src = {"hidden": f"hidden offset={a.offset}", "spectral": "spectral e_t",
+           "edges": f"spectral edges ({a.part})"}[a.source]
+    ax.set_title(f"Last-layer probes: {src} (seeds={len(a.seeds)}, group={group})")
     fig.tight_layout()
     fig.savefig(a.output / "summary.png", dpi=150)
     plt.close(fig)

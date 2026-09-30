@@ -27,7 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
 from extract import load_chunk, gen_view, seg_labels                    # noqa: E402
-from spectral import spectral_embedding, make_tag, DEVICE, K_EIG, SCALE, SIGN_MODE, SIGN_MODES  # noqa: E402
+from spectral import (make_tag, DEVICE, K_EIG, SCALE, SIGN_MODE, SIGN_MODES,  # noqa: E402
+                      tokens_cumulative)
 
 
 @torch.no_grad()
@@ -35,26 +36,31 @@ def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
                            k: int, scale: bool, sign_mode: str):
     """토큰마다 e_i 계산 (구간 시작점부터 그 토큰까지 누적, 구간 바뀌면 리셋).
 
+    계산은 inference/spectral.py 의 CumulativeSpectral(누적 그람 톱니)이 한다 (토큰마다 SVD 를
+    다시 도는 대신 n x n 그람을 한 행씩 키워 eigh — 같은 값, CPU 에서 ~15배 빠름).
+    이 함수는 그 결과를 heatmap / gsbs 가 쓰던 모양으로 돌려주는 얇은 껍데기다.
+
     반환: e_all (N x kd), last_of_step ({구간: 그 구간 마지막 토큰의 e_i}) —
-    후자는 5-1의 e_t와 동일해야 함(같은 슬라이스라 정의상 동일).
+    후자는 5-1의 e_t와 동일해야 함(같은 행렬이라 정의상 동일).
     """
-    e_list, last_of_step = [], {}
-    for t, (s, e) in enumerate(zip(boundaries, boundaries[1:])):
-        for i in range(s, e):
-            e_i, _, _, _ = spectral_embedding(E[s:i + 1].to(DEVICE), k, scale, sign_mode)
-            e_list.append(e_i)
-        last_of_step[t] = e_list[-1] if e > s else None
-    return torch.stack(e_list), last_of_step
+    e_all, _ = tokens_cumulative(E, boundaries, k, scale, sign_mode, DEVICE)
+    last_of_step = {t: (e_all[e - 1] if e > s else None)
+                    for t, (s, e) in enumerate(zip(boundaries, boundaries[1:]))}
+    return e_all, last_of_step
 
 
-def verify_against_spectral_states(last_of_step: dict, spectral_e: dict, atol: float = 1e-4):
+def verify_against_spectral_states(last_of_step: dict, spectral_e: dict,
+                                   rtol: float = 1e-3, atol: float = 1e-3):
     """spectral_states의 e_t(5-1)와 각 구간 마지막 토큰의 e_i(5-2)가 실제로
-    같은지 확인. 다르면 구현 버그."""
+    같은지 확인. 다르면 구현 버그.
+
+    5-1 은 (n x d) SVD, 5-2 는 (n x n) 그람 eigh 라 float32 반올림 수준(상대 1e-4)
+    의 차이는 정상이다. 그래서 절대 1e-4 가 아니라 상대 오차로 본다."""
     for t, e_5_2 in last_of_step.items():
         if e_5_2 is None or t not in spectral_e:
             continue
         e_5_1 = spectral_e[t]
-        if not torch.allclose(e_5_1, e_5_2, atol=atol):
+        if not torch.allclose(e_5_1, e_5_2, rtol=rtol, atol=atol):
             diff = (e_5_1 - e_5_2).abs().max().item()
             raise AssertionError(f"segment {t}: 5-1과 5-2 마지막 토큰 불일치 (max diff={diff})")
     return True

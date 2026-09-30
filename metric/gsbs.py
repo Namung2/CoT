@@ -11,7 +11,17 @@ GSBS(Geerligs et al. 2021, Neuroimage)는 (시점 x 복셀) 행렬을 "안정적
 구간은 extract.gen_view 기준 — 프롬프트는 빼고 step 1..N + 터미널(정답 문장).
 프롬프트가 전체 토큰의 2/3 라 넣으면 GSBS 가 프롬프트 내부 구조에 상태를 다 쓴다.
 
---input 으로 복셀에 무엇을 둘지 고른다. 시점은 둘 다 토큰이다.
+--scope 로 GSBS 를 어디에 돌릴지 고른다. 기본은 step.
+
+    all   전체 토큰열(step 1..N + 터미널)에 한 번. 텍스트 경계와 GSBS 경계를
+          매칭(P/R/F1)하고, 구간 내부 추가 분할도 집계한다.
+    step  구간마다 따로. step 이 5개면 GSBS 를 5번(+터미널 1번) 돌린다. 각 구간이
+          독립된 시계열이 되어 kmax·최적 상태 수·t-distance 가 구간별로 나온다.
+          텍스트 경계는 구간 밖에 있으니 P/R/F1 은 계산하지 않고, substep_splits
+          가 유일한 결과다. 구간 내부 구조가 다른 구간의 분산에 묻히지 않는다.
+          토큰이 --min-tokens 미만인 구간은 건너뛴다(경계 0개, skipped=True).
+
+--input 으로 복셀에 무엇을 둘지 고른다. 시점은 둘 다 토큰이다. 기본은 spectral.
 
     tokens    원본 E                복셀 5120      step 정보 없음
     spectral  토큰별 누적 e_t        복셀 k*5120    구간 시작에서 리셋됨
@@ -25,15 +35,19 @@ GSBS 가 구간 경계를 찾는 건 당연하고, 보고 싶은 건 "구간 안
     substep_splits 의 rel_pos(구간 내 상대 위치)가 앞쪽에 몰려 있으면 아티팩트를
     의심하고, --input tokens 결과와 위치가 겹치는지 대조할 것.
 
-그림 두 종류를 낸다.
+그림.
 
-  overlay : 토큰x토큰 코사인 유사도 위에 step 경계(빨강)와 GSBS 경계(흰색)를
-            겹쳐 그린다.
-  reset   : heatmap.py의 누적 e_i 히트맵을 두 장 그린다. 왼쪽은 리셋 지점이 step
-            경계, 오른쪽은 GSBS 경계. 어느 쪽 블록이 더 또렷한지 본다.
+  overlay : GSBS 가 본 행렬(토큰x토큰 코사인 유사도) 위에 step 경계(빨강)와 GSBS
+            경계(흰색)를 겹쳐 그린다. scope=step 이면 흰 선이 step 내부 경계다.
+  reset   : scope=all 에서만. 누적 e_i 를 리셋 지점만 바꿔 두 장 그린다(왼쪽 step
+            경계, 오른쪽 GSBS 경계). step 모드는 기존 e_i 를 그대로 보는 게 목적이라
+            안 그린다.
+
+  기본 실행 = step 마다 그 step 의 토큰별 누적 e_i (n_t x k*5120) 에 GSBS 를 따로 돌린다.
 
     python metric/gsbs.py --task decompose --level BabyAI-GoToObj-v0 --status success
-    python metric/gsbs.py --task decompose --level BabyAI-GoToObj-v0 --status success --input spectral -k 8
+    python metric/gsbs.py --task decompose --level BabyAI-GoToObj-v0 --status success -k 16
+    python metric/gsbs.py --task decompose --level BabyAI-GoToObj-v0 --status success --scope all --input tokens
 """
 from __future__ import annotations
 
@@ -121,6 +135,44 @@ def run_gsbs(X_t: torch.Tensor, kmax: int | None, reduce: int | None,
     return np.nonzero(g.get_deltas())[0], g, X
 
 
+def run_gsbs_per_segment(X_t: torch.Tensor, seg: list[int], kmax: int | None,
+                         reduce: int | None, statewise: bool = False,
+                         min_tokens: int = 4):
+    """구간(seg[t]:seg[t+1])마다 run_gsbs 를 따로 돌린다.
+
+    반환 (전역 좌표 경계 배열, 구간별 결과 리스트). 구간별 결과의 bounds 는 전역
+    토큰 좌표(구간 시작 오프셋을 더한 값)이고, 구간 시작점 자체는 절대 안 들어간다
+    (run_gsbs 가 0번 시점에 경계를 안 찍으므로).
+
+    kmax 는 구간마다 "그 구간 토큰수/2" 로 다시 잡힌다(--kmax 를 주면 그 이하로).
+    min_tokens 미만인 구간은 GSBS 를 못 돌리므로(시점 2개 이하면 t-distance 가
+    정의 안 됨) 건너뛰고 경계 0개로 기록한다."""
+    names = seg_labels(seg)
+    per, all_b = [], []
+    for t, (s, e) in enumerate(zip(seg, seg[1:])):
+        n = int(e - s)
+        rec = {"segment": t, "name": names[t], "start": int(s), "end": int(e),
+               "n_tokens": n}
+        if n < min_tokens:
+            rec.update({"skipped": True, "kmax": 0, "kmax_saturated": False,
+                        "n_states": 1, "bounds": [], "tdists": [], "voxels_used": 0,
+                        "seconds": 0.0})
+            per.append(rec)
+            continue
+        t0 = time.perf_counter()
+        local_b, g, X = run_gsbs(X_t[s:e], kmax, reduce, statewise=statewise)
+        glob_b = [int(s + b) for b in local_b]
+        rec.update({"skipped": False, "kmax": int(g.kmax),
+                    "kmax_saturated": bool(g.nstates >= g.kmax - 1),
+                    "n_states": int(g.nstates), "bounds": glob_b,
+                    "tdists": [float(v) for v in g.tdists],
+                    "voxels_used": int(X.shape[1]),
+                    "seconds": round(time.perf_counter() - t0, 2)})
+        per.append(rec)
+        all_b.extend(glob_b)
+    return np.asarray(sorted(all_b), dtype=int), per
+
+
 def compare(pred: np.ndarray, true: np.ndarray, tol: int):
     """구간 경계마다 tol 이내의 GSBS 경계를 하나씩 짝지어 준다 (중복 매칭 없음).
 
@@ -164,11 +216,15 @@ def substep_splits(pred: np.ndarray, seg: list[int]):
 # ---------------------------------------------------------------------- 그림
 
 def plot_overlay(X_in: torch.Tensor, seg: list[int], pred_b: np.ndarray,
-                 cmp_: dict, out_path: Path, title: str):
+                 cmp_: dict | None, out_path: Path, title: str,
+                 within_step: bool = False):
     """GSBS 가 실제로 본 표현의 시점x시점 코사인 유사도 위에 두 경계를 겹친다.
 
     input=tokens 면 원본 E 끼리, input=spectral 이면 누적 e_t 끼리의 히트맵과
-    같은 행렬이 된다 (heatmap.py --rep raw / --rep spectral 과 대응)."""
+    같은 행렬이 된다 (heatmap.py --rep raw / --rep spectral 과 대응).
+
+    cmp_=None 이면(scope=step) 텍스트 경계 매칭이 없으니 연두색 표시와 P/R/F1 을
+    빼고 GSBS 경계 수만 적는다."""
     import matplotlib.pyplot as plt
 
     S = heatmap_matrix(X_in.float()).numpy()
@@ -177,24 +233,37 @@ def plot_overlay(X_in: torch.Tensor, seg: list[int], pred_b: np.ndarray,
     im = ax.imshow(S, cmap="viridis", vmin=-1, vmax=1)
     fig.colorbar(im, ax=ax, label="cosine similarity")
 
-    # 텍스트 경계는 몇 개 안 되니 전체 선으로, GSBS 경계는 수십 개라 가장자리 눈금으로
-    # (전체 선으로 그리면 행렬이 안 보인다). 텍스트 경계와 짝지어진 것은 연두색.
-    for b in seg[1:-1]:
-        ax.axvline(b - 0.5, color="red", lw=1.2, alpha=0.8)
-        ax.axhline(b - 0.5, color="red", lw=1.2, alpha=0.8)
-    matched = {p for _, p in cmp_["matched"]}
+    # GSBS 경계는 흰색, 텍스트 경계는 빨강을 위에 겹친다.
+    # scope=step(within_step=True) 이면 GSBS 는 그 step 안에서만 돌았으니 흰 선도
+    # 그 step 의 대각 블록 [s,e) 안에서만 긋는다. scope=all 이면 행렬 전체 선.
+    # 텍스트 경계와 짝지어진 GSBS 경계는 연두색.
+    matched = {p for _, p in cmp_["matched"]} if cmp_ else set()
+    lw = 0.9 if pred_b.size <= 40 else 0.4
     for b in pred_b:
         c = "lime" if b in matched else "white"
-        ax.axvline(b - 0.5, ymin=0.0, ymax=0.045, color=c, lw=1.3)
-        ax.axhline(b - 0.5, xmin=0.0, xmax=0.045, color=c, lw=1.3)
+        if within_step:
+            s, e = next((s, e) for s, e in zip(seg, seg[1:]) if s < b < e)
+            ax.vlines(b - 0.5, s - 0.5, e - 0.5, color=c, lw=lw, alpha=0.9)
+            ax.hlines(b - 0.5, s - 0.5, e - 0.5, color=c, lw=lw, alpha=0.9)
+        else:
+            ax.axvline(b - 0.5, color=c, lw=lw, alpha=0.9)
+            ax.axhline(b - 0.5, color=c, lw=lw, alpha=0.9)
+    for b in seg[1:-1]:
+        ax.axvline(b - 0.5, color="red", lw=1.2, alpha=0.9)
+        ax.axhline(b - 0.5, color="red", lw=1.2, alpha=0.9)
 
-    ax.set_xlabel("token (prompt 제외)")
-    ax.set_title(f"red line = text boundary ({len(seg) - 2}) | edge tick = GSBS "
-                 f"({pred_b.size + 1} states, lime = matched)", fontsize=9)
-    fig.suptitle(f"{title}\n"
-                 f"matched {cmp_['n_matched']}/{len(seg) - 2} text bounds  "
-                 f"(P={cmp_['precision']:.2f} R={cmp_['recall']:.2f} "
-                 f"F1={cmp_['f1']:.2f}, tol={cmp_['tolerance']})", fontsize=10)
+    ax.set_xlabel("token (prompt excluded)")
+    if cmp_ is not None:
+        ax.set_title(f"red = text boundary ({len(seg) - 2}) | white = GSBS "
+                     f"({pred_b.size + 1} states, lime = matched)", fontsize=9)
+        sub = (f"matched {cmp_['n_matched']}/{len(seg) - 2} text bounds  "
+               f"(P={cmp_['precision']:.2f} R={cmp_['recall']:.2f} "
+               f"F1={cmp_['f1']:.2f}, tol={cmp_['tolerance']})")
+    else:
+        ax.set_title(f"red = text boundary ({len(seg) - 2}) | white = GSBS "
+                     f"per step ({pred_b.size} inner boundaries)", fontsize=9)
+        sub = f"GSBS run separately in each of {len(seg) - 1} segments"
+    fig.suptitle(f"{title}\n{sub}", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -212,11 +281,24 @@ def plot_reset(E: torch.Tensor, seg: list[int], gsbs_b: list[int],
         e_all, _ = cumulative_within_step(E, bounds, k, scale, sign_mode)
         sim = heatmap_matrix(e_all).numpy()
         im = ax.imshow(sim, cmap="viridis", vmin=-1, vmax=1)
+        # GSBS 가 만든 블록은 흰색, 텍스트 step 블록은 빨강(위에 겹쳐 그림).
+        # 왼쪽(bounds == seg)은 둘이 같으니 빨강만 나온다.
+        text_pts = set(seg)
+        n_inner = 0
         for s, e in zip(bounds, bounds[1:]):
+            if s in text_pts and e in text_pts:
+                continue
+            n_inner += 1
+            ax.add_patch(patches.Rectangle((s - 0.5, s - 0.5), e - s, e - s,
+                                           linewidth=1.0, edgecolor="white", facecolor="none"))
+        for s, e in zip(seg, seg[1:]):
             ax.add_patch(patches.Rectangle((s - 0.5, s - 0.5), e - s, e - s,
                                            linewidth=1.3, edgecolor="red", facecolor="none"))
-        ax.set_title(f"{name}  ({len(bounds) - 1} segments)", fontsize=10)
-        ax.set_xlabel("token (prompt 제외)")
+        sub = f"  ({len(bounds) - 1} segments)"
+        if n_inner:
+            sub = f"  (red = {len(seg) - 1} text steps, white = {n_inner} GSBS blocks)"
+        ax.set_title(f"{name}{sub}", fontsize=10)
+        ax.set_xlabel("token (prompt excluded)")
         fig.colorbar(im, ax=ax, fraction=0.046, label="cosine similarity")
 
     fig.suptitle(title, fontsize=11)
@@ -249,10 +331,15 @@ def main():
     ap.add_argument("--level", required=True)
     ap.add_argument("--status", default="success", choices=["success", "failure"])
     ap.add_argument("--seed", type=int, default=None, help="env_seed. 안 주면 첫 episode")
-    ap.add_argument("--input", default="tokens", choices=["tokens", "spectral"],
+    ap.add_argument("--input", default="spectral", choices=["tokens", "spectral"],
                     help="tokens=원본 E(복셀 5120) | spectral=토큰별 누적 e_t(복셀 k*5120)")
+    ap.add_argument("--scope", default="step", choices=["all", "step"],
+                    help="all=전체 토큰열에 GSBS 한 번 | step=구간(step/answer)마다 따로")
+    ap.add_argument("--min-tokens", type=int, default=4,
+                    help="scope=step 에서 이보다 짧은 구간은 건너뜀 (t-distance 정의 불가)")
     ap.add_argument("--kmax", type=int, default=None,
-                    help="GSBS 최대 상태 수. 기본은 토큰수/2 (문서 권장값). 크면 느리다")
+                    help="GSBS 최대 상태 수. 기본은 토큰수/2 (문서 권장값; scope=step 이면 "
+                         "구간 토큰수/2). 크면 느리다")
     ap.add_argument("--reduce", type=int, default=0,
                     help="행중심화 SVD로 복셀 축소. 0(기본)=full rank(=시점수)로 무손실 축소, "
                          "양수=상위 N개만, 음수=축소 안 함(원본 차원 그대로)")
@@ -273,19 +360,49 @@ def main():
 
     t0 = time.perf_counter()
     X_in = build_input(E, seg, args.input, args.k, SCALE, args.sign_mode)
-    pred_b, g, X = run_gsbs(X_in, args.kmax, None if args.reduce < 0 else args.reduce,
-                            statewise=args.statewise)
-    print(f"GSBS: {g.nstates} states, {pred_b.size} boundaries "
-          f"(kmax={g.kmax}, voxels {X_in.shape[1]}->{X.shape[1]}, "
-          f"{time.perf_counter() - t0:.0f}s)")
-    if g.nstates >= g.kmax - 1:
-        print(f"warning: 최적 k가 kmax({g.kmax})에 붙었다 — t-distance가 아직 오르는 중이라 "
-              f"진짜 최적이 아닐 수 있음", file=sys.stderr)
+    reduce = None if args.reduce < 0 else args.reduce
 
-    cmp_ = compare(pred_b, np.asarray(seg[1:-1]), args.tol)
-    print(f"텍스트 경계 {len(seg) - 2}개 중 {cmp_['n_matched']}개를 GSBS도 찾음 "
-          f"(tol={args.tol})  P={cmp_['precision']:.3f} R={cmp_['recall']:.3f} "
-          f"F1={cmp_['f1']:.3f}")
+    if args.scope == "all":
+        pred_b, g, X = run_gsbs(X_in, args.kmax, reduce, statewise=args.statewise)
+        voxels_used = int(X.shape[1])
+        gsbs_info = {"kmax": int(g.kmax), "kmax_saturated": bool(g.nstates >= g.kmax - 1),
+                     "n_states_gsbs": int(g.nstates),
+                     "tdists": [float(v) for v in g.tdists]}
+        per_seg = None
+        print(f"GSBS: {g.nstates} states, {pred_b.size} boundaries "
+              f"(kmax={g.kmax}, voxels {X_in.shape[1]}->{X.shape[1]}, "
+              f"{time.perf_counter() - t0:.0f}s)")
+        if g.nstates >= g.kmax - 1:
+            print(f"warning: 최적 k가 kmax({g.kmax})에 붙었다 — t-distance가 아직 오르는 중이라 "
+                  f"진짜 최적이 아닐 수 있음", file=sys.stderr)
+
+        cmp_ = compare(pred_b, np.asarray(seg[1:-1]), args.tol)
+        print(f"텍스트 경계 {len(seg) - 2}개 중 {cmp_['n_matched']}개를 GSBS도 찾음 "
+              f"(tol={args.tol})  P={cmp_['precision']:.3f} R={cmp_['recall']:.3f} "
+              f"F1={cmp_['f1']:.3f}")
+    else:
+        pred_b, per_seg = run_gsbs_per_segment(X_in, seg, args.kmax, reduce,
+                                               statewise=args.statewise,
+                                               min_tokens=args.min_tokens)
+        ran = [r for r in per_seg if not r["skipped"]]
+        voxels_used = max((r["voxels_used"] for r in ran), default=0)
+        gsbs_info = {"kmax": None, "kmax_saturated": any(r["kmax_saturated"] for r in ran),
+                     "n_states_gsbs": int(sum(r["n_states"] for r in per_seg)),
+                     "tdists": None}
+        cmp_ = None                              # 텍스트 경계가 구간 밖이라 매칭 무의미
+        print(f"GSBS per segment: {len(ran)}/{len(per_seg)} segments run, "
+              f"{pred_b.size} inner boundaries total ({time.perf_counter() - t0:.0f}s)")
+        for r in per_seg:
+            if r["skipped"]:
+                print(f"  {r['name']:8s} [{r['start']:4d}:{r['end']:4d}] {r['n_tokens']:4d}토큰 "
+                      f"-> skipped (< {args.min_tokens})")
+                continue
+            sat = "  (kmax 포화)" if r["kmax_saturated"] else ""
+            print(f"  {r['name']:8s} [{r['start']:4d}:{r['end']:4d}] {r['n_tokens']:4d}토큰 "
+                  f"-> {r['n_states']} states, kmax={r['kmax']}, {r['seconds']}s{sat}")
+        if gsbs_info["kmax_saturated"]:
+            print("warning: 일부 구간에서 최적 k가 kmax에 붙었다 — --kmax 를 올려볼 것",
+                  file=sys.stderr)
 
     splits = substep_splits(pred_b, seg)
     print("구간 내부 추가 분할:")
@@ -303,31 +420,37 @@ def main():
     itag = "tokens" if args.input == "tokens" else f"spectral_k{args.k}_{args.sign_mode}"
     if args.reduce != 0:
         itag += f"_red{args.reduce}"
-    base = f"{args.task}_{args.level}_{args.status}_{seed}_{itag}"
+    if args.scope == "step":
+        itag += "_step"
+    base = f"{args.task}_{args.level.replace('/', '_')}_{args.status}_{seed}_{itag}"
     title = (f"{args.task}/{args.level}/{args.status} seed={seed} "
-             f"(n_tok={n}, input={args.input}, voxels={X.shape[1]})")
+             f"(n_tok={n}, input={args.input}, scope={args.scope}, voxels={voxels_used})")
 
-    plot_overlay(X_in, seg, pred_b, cmp_, args.out_dir / f"{base}_overlay.png", title)
+    plot_overlay(X_in, seg, pred_b, cmp_, args.out_dir / f"{base}_overlay.png", title,
+                 within_step=(args.scope == "step"))
     print(f"saved -> {args.out_dir / base}_overlay.png")
 
-    gsbs_full = [0] + pred_b.tolist() + [n]
-    plot_reset(E, seg, gsbs_full, args.k, SCALE, args.sign_mode,
-               args.out_dir / f"{base}_reset.png",
-               f"{title}   k={args.k} sign={args.sign_mode}")
-    print(f"saved -> {args.out_dir / base}_reset.png")
+    # reset 그림은 scope=all 에서만. step 모드는 "지금 있는 데이터(step 단위 누적·리셋)
+    # 안에서 경계가 얼마나 생기는지" 를 보는 게 목적이라 e_i 를 다시 만들 이유가 없다.
+    if args.scope == "all":
+        gsbs_full = [0] + pred_b.tolist() + [n]
+        plot_reset(E, seg, gsbs_full, args.k, SCALE, args.sign_mode,
+                   args.out_dir / f"{base}_reset.png",
+                   f"{title}   k={args.k} sign={args.sign_mode}")
+        print(f"saved -> {args.out_dir / base}_reset.png")
 
     out_json = args.out_dir / f"{base}.json"
     out_json.write_text(json.dumps({
         "task": args.task, "level": args.level, "status": args.status, "env_seed": int(seed),
         "n_tokens": int(n), "voxels_in": int(X_in.shape[1]),
-        "voxels_used": int(X.shape[1]), "reduce": args.reduce, "statewise": args.statewise,
-        "kmax": int(g.kmax), "kmax_saturated": bool(g.nstates >= g.kmax - 1),
-        "n_states_gsbs": int(g.nstates),
+        "voxels_used": voxels_used, "reduce": args.reduce, "statewise": args.statewise,
+        "scope": args.scope, "min_tokens": args.min_tokens,
+        **gsbs_info,
         "n_segments_text": len(seg) - 1, "n_steps_text": len(seg) - 2,
         "input": args.input, "k": args.k, "sign_mode": args.sign_mode,
         "gsbs_bounds": pred_b.tolist(), "text_bounds": seg[1:-1],
         "compare": cmp_, "substep_splits": splits,
-        "tdists": [float(v) for v in g.tdists],
+        "per_segment": per_seg,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"saved -> {out_json}")
 
