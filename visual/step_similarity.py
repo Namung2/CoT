@@ -5,9 +5,9 @@ intra-step : 한 스텝 안 토큰들끼리의 평균 코사인 유사도 (hidde
 inter-step : 스텝 t와 t+d의 유사도, 대표 벡터 두 가지로 각각 계산
   - last_token : 그 스텝의 마지막 토큰 벡터 (attention으로 이미 그 스텝을 반영한, 모델이
                  자체적으로 만든 대표값)
-  - e_t        : spectral_states의 e_t (우리가 SVD로 명시적으로 요약한 대표값)
+  - e_t        : latent/spectral 저장본의 구간 마지막 e_t (우리가 명시적으로 요약한 대표값)
 
-새 추출 없이 기존 hidden_states/spectral_states만 읽는다.
+새 추출 없이 기존 hidden_states/spectral 저장본만 읽는다.
 --seed 안 주면 레벨 전체 episode를 풀링해서 평균, 주면 그 episode 하나만(다른 episode랑 안 섞임).
 
     python visual/step_similarity.py --task decompose --level BabyAI-GoToObj-v0 --status success
@@ -27,7 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
 
 from extract import load_chunk                                      # noqa: E402
-from spectral import make_tag, K_EIG, SCALE, SIGN_MODE, SIGN_MODES  # noqa: E402
+from spectral import (make_tag, segment_last, K_EIG, SCALE, SIGN_MODE, SIGN_MODES,  # noqa: E402
+                      N_FRONT, N_BACK)
 
 
 def intra_step_similarity(E: torch.Tensor, boundaries: list[int]) -> dict[int, float]:
@@ -62,11 +63,12 @@ def inter_step_similarity(reps: dict[int, torch.Tensor]) -> dict[int, list[float
 
 def run(hidden_dir: Path, spectral_dir: Path, task: str, level: str, status: str,
         seed: int | None = None, ctx_tag: str = "with_prompt",
-        k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE):
+        k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
+        n_front: int = N_FRONT, n_back: int = N_BACK):
     """seed=None이면 레벨 전체 episode를 다 풀링해서 평균(기존 동작).
     seed를 주면 그 episode 하나만 갖고 계산 — 다른 episode랑 안 섞임."""
     h_dir = hidden_dir / task / level / ctx_tag / status
-    s_dir = spectral_dir / task / level / ctx_tag / status / make_tag(k, scale, sign_mode)
+    s_dir = spectral_dir / task / level / ctx_tag / status / make_tag(k, scale, sign_mode, n_front, n_back)
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
     if not s_dir.is_dir():
         print(f"warning: {s_dir} 없음 — inter_step_e_t 가 비게 됨 "
@@ -106,7 +108,7 @@ def run(hidden_dir: Path, spectral_dir: Path, task: str, level: str, status: str
             if sd not in spectral_episodes:
                 n_no_spectral += 1
                 continue
-            e_reps = spectral_episodes[sd]["e"]
+            e_reps = segment_last(spectral_episodes[sd])
             for d, sims in inter_step_similarity(e_reps).items():
                 inter_e.setdefault(d, []).extend(sims)
 
@@ -184,9 +186,11 @@ def main():
                          "안 주면 레벨 전체 episode를 풀링해서 평균(기존 동작)")
     ap.add_argument("-k", type=int, default=K_EIG)
     ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
-                    help="읽을 spectral_states 디렉토리를 정함 (spectral 을 돌린 값과 같게)")
+                    help="읽을 spectral 저장본 디렉토리를 정함 (spectral 을 돌린 값과 같게)")
+    ap.add_argument("--n-front", type=int, default=N_FRONT, help="읽을 spectral 저장본의 n_front")
+    ap.add_argument("--n-back", type=int, default=N_BACK, help="읽을 spectral 저장본의 n_back (≥1)")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
-    ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
+    ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "step_similarity")
     args = ap.parse_args()
 
@@ -196,7 +200,8 @@ def main():
         name += f"_{args.seed}"
 
     summary = run(args.hidden_dir, args.spectral_dir, args.task, args.level, args.status,
-                 seed=args.seed, k=args.k, sign_mode=args.sign_mode)
+                 seed=args.seed, k=args.k, sign_mode=args.sign_mode,
+                 n_front=args.n_front, n_back=args.n_back)
 
     (args.out_dir / f"{name}.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

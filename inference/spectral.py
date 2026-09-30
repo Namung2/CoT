@@ -1,65 +1,57 @@
 #!/usr/bin/env python
-"""hidden state → spectral embedding e. 구간(step) 단위, 토큰 단위, 가장자리 저장까지 한 파일.
+"""hidden state → spectral embedding e 를 만들어 저장한다.
 
-    E_t (n x d): 구간 t 의 토큰 hidden state.  e_t = [σ₁v₁; …; σ_k v_k]  (kd,)
-    v_k 는 E_t 의 우특이벡터, σ_k² = λ_k 는 그람 G_t = E_t E_tᵀ 의 고유값.
+    E (n x d): 구간(step) 하나의 토큰 hidden state 들.   e = [σ₁v₁; …; σ_k v_k]  (kd,)
+    v_k 는 E 의 우특이벡터(토큰들이 퍼진 주축), σ_k² = λ_k 는 그람 G = E Eᵀ 의 고유값.
 
-세 가지 계산 경로가 있고 결과는 (같은 행렬이면) 서로 같다.
+토큰 단위 누적. 구간 안에서 토큰이 하나 쌓일 때마다 "구간 첫 토큰부터 지금까지" 의 행렬로
+e_i 를 다시 만든다 (구간 경계에서 리셋). 구간 마지막 토큰의 e_i 가 곧 구간 전체의 e_t 다.
+계산은 CumulativeSpectral 이 한다: (n x d) SVD 를 토큰마다 다시 도는 대신 (n x n) 그람을
+eigh 하고 σ_k v_k = Eᵀu_k 로 바꾼다. d=5120 ≫ n 이라 훨씬 싸고, 결과는 SVD 와 같다.
 
-  1. 구간 단위 (spectral_embedding / spectral_run)
-     E_t 를 통째로 SVD 해서 e_t 하나. 결과는 <spectral_dir>/<task>/<level>/<status>/<tag>/chunk_*.pt
-     에 저장된다. inference/main.py 가 부른다.
+무엇을 저장하나. e 하나가 k·d 실수(k=8: 160KB)라 토큰 전부를 저장하면 에피소드당 ~100MB,
+레벨당 수십 GB 가 된다. 그래서 구간마다 "앞 n_front 개" 와 "뒤 n_back 개" 만 남긴다.
 
-  2. 토큰 단위 (CumulativeSpectral / stream_* / tokens_cumulative / stream_dataset)
-     토큰이 하나 쌓일 때마다 누적 그람 → eigh → e_i. 리셋은 구간 경계에서만.
-         토큰 1     → e_1,  토큰 1,2 → e_2,  …  [구간 경계] → 리셋
-     각 구간의 마지막 e_i 는 1 의 e_t 와 같다. e_i 하나가 k·d 실수(k=8: 160KB)라
-     전부 저장하면 에피소드당 ~100MB 가 되므로 파일을 만들지 않고 제너레이터로 흘려보낸다.
-     heatmap / gsbs 가 이걸 받아서 필요한 만큼만 소비한다.
+    n_front=0, n_back=1   구간마다 마지막 e_t 하나 (구간 전체 SVD 와 같은 값)      ← 기본
+    n_front=5, n_back=5   형식 문구 뒤 5개 + 마지막 5개 (probing 의 edges 입력)
+    n_front=0, n_back=10  마지막 10개
 
-     수학 (왜 그람으로 하는가): G = E Eᵀ (n x n) 을 eigh 하면 λ_k = σ_k², u_k 는 좌특이벡터,
-     σ_k v_k = Eᵀ u_k 가 나눗셈 없이 나온다 (σ_k = 0 이면 0 벡터). d=5120 ≫ n 이라
-     (n x d) SVD 를 토큰마다 다시 도는 것보다 (n x n) eigh 가 훨씬 싸고, 그람은 토큰 하나에
-     행/열 하나만 더 계산하면 된다. 부호 보정도 u 와 Eᵀu 만으로 같은 값이 나온다 (fix_sign).
+    구간 t 의 토큰 0..n-1, marker = 구간 앞 형식 문구가 차지하는 토큰 수
+        step 구간: "Step N:" 헤더 / 터미널 구간: 정답 앞 문구 (extract.TERMINAL_PAT)
+    front = 위치 marker .. marker+n_front-1   (형식 토큰의 e 는 버리되 누적에는 포함)
+    back  = 위치 n-n_back .. n-1
+    구간이 짧으면 front/back 은 겹칠 수 있고, 모자라면 있는 만큼만 넣는다 (짧은 구간 제외는
+    읽는 쪽이 marker+n_front+n_back 로 한다).
 
-  3. 가장자리 (episode_edges / CLI `edges`)
-     구간마다 토큰별 누적 e_i 중 "앞 n_front 개"와 "뒤 n_back 개"만 뽑아
-     <out_dir>/<task>/<level>/<status>/<tag>/chunk_*.pt 에 저장한다 (predict/probing.py 입력).
-         marker = 구간 앞 형식 문구가 차지하는 토큰 수
-                  step 구간: "Step N:" 헤더 / 터미널 구간: 정답 앞 문구 (TERMINAL_PAT)
-         front  = 위치 marker .. marker+n_front-1   (형식 토큰의 e 는 버림, 누적에는 포함)
-         back   = 위치 n-n_back .. n-1              (마지막 = 1 의 e_t)
-     marker 는 원본 jsonl 을 추출 때와 똑같이 토크나이즈해서 STEP_PAT 매치가 끝나는 문자
-     위치까지 걸친 토큰 수로 센다. 토큰 수/경계가 hidden_states 와 다르면 그 에피소드는 버린다.
-     원본 텍스트가 없으면 --fallback-marker TASK=S:T 로 태스크별 고정 길이를 쓸 수 있다
-     (Qwen3 토크나이저 샘플값: decompose 4:3, plan 4:9, predict 5:7). 어느 쪽인지는
-     에피소드마다 "marker_src" ("text" | "fixed") 에 남는다. 짧은 구간 제외는 여기서 하지 않는다.
+marker 는 n_front > 0 일 때만 필요하다. 원본 jsonl (traj_dir) 을 추출 때와 똑같이 토크나이즈해
+STEP_PAT 매치가 끝나는 문자 위치까지 걸친 토큰 수로 센다. 토큰 수/경계가 hidden_states 와
+다르면 그 에피소드는 버리고 사유를 센다. 원본이 없으면 fallback (TASK → (S, T)) 으로 태스크별
+고정 길이를 쓴다 (Qwen3 샘플값: decompose 4:3, plan 4:9, predict 5:7). 어느 쪽인지는
+에피소드마다 "marker_src" ("text" | "fixed" | "none") 에 남는다.
 
-     출력 레코드: {"k", "scale", "sign_mode", "n_front", "n_back", "src", "model",
-                   "episodes": {seed: {"seg", "labels", "marker": [m_0..m_N], "marker_src",
-                                       "front": {t: (nf, kd)}, "front_pos": {t: [...]},
-                                       "back":  {t: (nb, kd)}, "back_pos":  {t: [...]}}}}
-
-구간 번호 t 는 전부 extract.gen_view 기준: 0..N-1 = Step 1..N, N = 터미널 (프롬프트 제외).
-heatmap.py / gsbs.py 도 같은 gen_view 를 쓰므로 구간 인덱스가 맞물린다.
+출력: <out_dir>/<task>/<level>/<status>/<tag>/chunk_XXXX.pt,  tag = make_tag(...) 예: k8_scaled_sign-data_f0_b1
+    {"k", "scale", "sign_mode", "n_front", "n_back", "src", "model",
+     "episodes": {seed: {"seg": [...], "labels": [...], "marker": [m_0..m_N], "marker_src": str,
+                         "front": {t: (nf, kd)}, "front_pos": {t: [...]}, "front_lam": {t: (nf, k)},
+                         "back":  {t: (nb, kd)}, "back_pos":  {t: [...]}, "back_lam":  {t: (nb, k)}}}}
+    t 는 extract.gen_view 구간 번호 (0..N-1 = Step 1..N, N = 터미널, 프롬프트 제외). pos 는 구간 안
+    0-based 위치. 구간 마지막 e_t 는 back[t][-1] (segment_last 가 꺼내 준다). 단위 고유벡터가 필요하면
+    CumulativeSpectral.eigvecs(e, lam) 으로 복원한다.
 
 Usage:
-    # 1. 구간 단위 저장 → inference/main.py
-    # 2. 토큰 단위 스트리밍 확인 / SVD 와 대조
-    python inference/spectral.py stream --task decompose --level BabyAI-GoToObj-v0 --status success --verify
-    # 3. 가장자리 저장
-    python inference/spectral.py edges                        # 전체, k8 data
-    python inference/spectral.py edges -k 4 8 16 --sign-mode data max
-    python inference/spectral.py edges --task decompose --verify
-    python inference/spectral.py edges --fallback-marker decompose=4:3 plan=4:9 predict=5:7
+    python inference/main.py ...                                   # extract + 저장 (기본 f0_b1)
+    python inference/spectral.py                                   # 전체 task/level/status, k8 data f0_b1
+    python inference/spectral.py --n-front 5 --n-back 5 -k 4 8 16 --sign-mode data max
+    python inference/spectral.py --task decompose --n-back 10
+    python inference/spectral.py --n-front 5 --fallback-marker decompose=4:3 plan=4:9 predict=5:7
 """
 from __future__ import annotations
 
+import sys
 import time
 import hashlib
 import argparse
 from pathlib import Path
-from dataclasses import dataclass
 from collections import Counter
 from typing import Iterator
 
@@ -67,41 +59,44 @@ import torch
 from tqdm import tqdm
 
 import extract
-from extract import (MODEL, STEP_PAT, TERMINAL_PAT, load_episodes, load_chunk, gen_view, gen_views,
+from extract import (MODEL, STEP_PAT, TERMINAL_PAT, load_episodes, load_chunk, gen_view,
                      seg_labels, step_char_bounds, char_to_token_bounds)
 
 ROOT = Path(__file__).resolve().parent.parent
 TASKS = ("decompose", "plan", "predict")
 
 K_EIG = 8
-SCALE = True        # E_t를 sqrt(n_t)로 나눠 토큰 수에 따른 고유값 증가를 방지
+SCALE = True        # E를 sqrt(n)로 나눠 토큰 수에 따른 고유값 증가를 방지
 SIGN_MODE = "data"  # "none" | "first" | "max" | "data"
 SIGN_MODES = ("none", "first", "max", "data")
+N_FRONT, N_BACK = 0, 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPS = 1e-12
 
 
-def make_tag(k: int, scale: bool, sign_mode: str) -> str:
-    """저장 디렉토리 이름. 예: k8_scaled_sign-data, k8_scaled (none).
+def make_tag(k: int, scale: bool, sign_mode: str, n_front: int = N_FRONT, n_back: int = N_BACK) -> str:
+    """저장 디렉토리 이름. 예: k8_scaled_sign-data_f0_b1, k8_f5_b5 (scale 없음, sign none).
 
-    읽는 쪽(visual/heatmap.py, visual/step_similarity.py, predict/probing.py)도 이 함수를 써야 한다 —
+    읽는 쪽(visual/heatmap.py, visual/step_similarity.py)도 이 함수를 써야 한다 —
     문자열을 손으로 베끼면 규칙이 바뀔 때 조용히 어긋난다."""
     if sign_mode not in SIGN_MODES:
         raise ValueError(f"unknown sign_mode: {sign_mode!r} (choose from {SIGN_MODES})")
+    if n_front < 0 or n_back < 0 or n_front + n_back == 0:
+        raise ValueError(f"need n_front, n_back ≥ 0 and not both 0 (got {n_front}, {n_back})")
     tag = f"k{k}" + ("_scaled" if scale else "")
     if sign_mode != "none":
         tag += f"_sign-{sign_mode}"
-    return tag
+    return tag + f"_f{n_front}_b{n_back}"
 
 
 # ------------------------------------------------------------------ 부호 보정
 
 def fix_sign(R: torch.Tensor, proj: torch.Tensor | None, mode: str):
-    """고유벡터 부호 보정. SVD 경로와 그람 경로가 같은 함수를 쓴다.
+    """고유벡터 부호 보정.
 
-    R    : (r, d)  부호를 정할 벡터들. v_k (SVD) 또는 σ_k v_k = Eᵀu_k (그람) — 부호 규칙은
-           양수 배율에 무관하므로 어느 쪽이든 같은 부호가 나온다.
-    proj : (n, r)  데이터 투영 v_k·x_i. SVD 경로는 E v_k, 그람 경로는 σ_k u_k. "data" 에서만 쓴다.
+    R    : (r, d)  부호를 정할 벡터들 σ_k v_k = Eᵀu_k. 부호 규칙은 양수 배율에 무관하므로
+           단위벡터 v_k 를 넘겨도 같은 부호가 나온다.
+    proj : (n, r)  데이터 투영 v_k·x_i = E v_k = σ_k u_k. "data" 에서만 쓴다.
 
     - "none":  보정 안 함
     - "first": 각 벡터의 첫 성분이 양수가 되도록
@@ -109,7 +104,8 @@ def fix_sign(R: torch.Tensor, proj: torch.Tensor | None, mode: str):
     - "data":  Bro, Acar & Kolda (2007)의 부호-가중 내적 점수
                s_k = Σ_i sign(v_k·x_i)(v_k·x_i)²  가 양수가 되도록. 대칭(Gram) 케이스 단순화 버전.
 
-    반환: (부호 보정된 R, score 또는 None). "data" 의 score 는 (r,) — |score|/λ ∈ [0,1]이 부호 신뢰도.
+    반환: (부호 보정된 R, score 또는 None). "data" 의 score 는 보정 전 s_k (r,) 로, 부호는
+    분해기가 뽑은 임의 초기 부호에 따르니 |score|/λ ∈ [0,1] 만 부호 신뢰도로 쓸 것.
     """
     if mode == "none":
         return R, None
@@ -147,91 +143,7 @@ def _pad_k(R: torch.Tensor, sig: torch.Tensor, score: torch.Tensor | None, k: in
     return R, sig, score
 
 
-# ------------------------------------------------------------ 1. 구간 단위 SVD
-
-@torch.no_grad()
-def spectral_embedding(Et: torch.Tensor, k: int, scale: bool, sign_mode: str):
-    """E_t (n x d) → (e (kd,), lam (k,), V (k x d), score (k,)|None). 전부 cpu."""
-    Et = Et.float()  # torch.linalg.svd는 bf16 미지원
-
-    if scale:
-        Et = Et / (Et.shape[0] ** 0.5)  # Et.shape[0] = n_t (부호에는 영향 없음)
-
-    _, S, Vh = torch.linalg.svd(Et, full_matrices=False)   # S:(r,), Vh:(r,d)
-    r = min(k, S.shape[0])                                 # rank(G_t) ≤ n_t
-    S_k, V_k = S[:r], Vh[:r]                               # 내림차순 보장됨
-
-    V_k, score = fix_sign(V_k, Et @ V_k.T, sign_mode)
-    V_k, S_k, score = _pad_k(V_k, S_k, score, k)
-
-    e_t = (S_k[:, None] * V_k).reshape(-1)   # [√λ₁q₁; ...; √λ_k q_k], (kd,)
-    lam = S_k ** 2                           # λ_i = σ_i²
-    score = score.cpu() if score is not None else None
-    return e_t.cpu(), lam.cpu(), V_k.cpu(), score
-
-
-@torch.no_grad()
-def episode_embeddings(views: list[torch.Tensor], k: int, scale: bool, sign_mode: str):
-    e, lam, V, sc = {}, {}, {}, {}
-    for t, Et in enumerate(views):
-        e[t], lam[t], V[t], s = spectral_embedding(Et.to(DEVICE), k, scale, sign_mode)
-        if s is not None:
-            sc[t] = s
-    return e, lam, V, sc
-
-
-def load_hidden_states(data_dir: Path, task: str, level: str, status: str):
-    """extract.py 출력 경로: <data_dir>/<task>/<level>/<status>/chunk_*.pt"""
-    target = data_dir / task / level / status
-    if not target.is_dir():
-        raise FileNotFoundError(f"no such directory: {target}")
-
-    files = sorted(target.glob("chunk_*.pt"))
-    if not files:
-        raise FileNotFoundError(f"no chunk_*.pt in {target}")
-    return files
-
-
-@torch.no_grad()
-def spectral_run(data_root: Path, out_root: Path, task: str, level: str,
-                 status: str, k: int = K_EIG, scale: bool = SCALE,
-                 sign_mode: str = SIGN_MODE):
-    """구간별 spectral embedding 을 만들어 저장한다 (inference/main.py 가 부른다).
-
-    gen_views 를 쓰므로 프롬프트는 빠지고 step 1..N + 터미널(정답 문장)이 들어간다.
-    딕셔너리 키 0..N-1 이 step 1..N, 키 N 이 터미널이다 (extract.seg_labels 와 동일).
-    """
-    data_root = data_root.resolve()
-    chunk_files = load_hidden_states(data_root, task, level, status)
-
-    tag = make_tag(k, scale, sign_mode)
-    rel = Path(task) / level
-    out_dir = out_root / rel / status / tag
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("chunk_*.pt"):   # hidden_states 청크 개수가 줄었을 때 낡은 파일 안 남게
-        old.unlink()
-
-    n_episodes = 0
-    for cf in tqdm(chunk_files, desc=f"{rel}/{status}/{tag}", unit="chunk"):
-        chunk = load_chunk(cf)
-        out = {}
-        for seed, episode in chunk.items():
-            _, _, views = gen_views(episode)
-            e, lam, V, sc = episode_embeddings(views, k, scale, sign_mode)
-            rec = {"e": e, "eigvals": lam, "V": V}
-            if sc:
-                rec["sign_score"] = sc
-            out[seed] = rec
-            n_episodes += 1
-
-        torch.save({"k": k, "scale": scale, "sign_mode": sign_mode,
-                    "src": str(cf), "model": MODEL, "episodes": out},
-                   out_dir / cf.name)
-
-    print(f"saved {n_episodes} episodes ({len(chunk_files)} chunks) under {out_dir}")
-
-
-# ------------------------------------------------------- 2. 토큰 단위 누적 그람
+# ---------------------------------------------------------- 토큰 단위 누적 그람
 
 class CumulativeSpectral:
     """구간 하나 안에서 토큰을 하나씩 받아 누적 그람 → e_i 를 낸다.
@@ -378,152 +290,48 @@ class CumulativeSpectral:
         return V
 
 
-# ------------------------------------------------------------- 에피소드 단위
-
-@dataclass
-class TokenRecord:
-    """토큰 하나의 누적 스펙트럴 결과. 인덱스는 전부 extract.gen_view 기준 (프롬프트 제외)."""
-    idx: int            # 생성 구간 안에서의 토큰 번호 (0..n_gen-1)
-    seg: int            # 구간 번호 (0..N-1 = step 1..N, N = 터미널)
-    pos: int            # 구간 안에서의 위치 (0 = 리셋 직후 첫 토큰)
-    reset: bool         # pos == 0
-    last: bool          # 구간의 마지막 토큰 (이 e 가 spectral_run 의 e_t 와 같다)
-    e: torch.Tensor     # (kd,)
-    lam: torch.Tensor   # (k,)
-    score: torch.Tensor | None   # (k,)  sign_mode == "data" 일 때만
-
-    @property
-    def is_last_of_seg(self) -> bool:
-        return self.last
-
-
-@torch.no_grad()
-def stream_tokens(E: torch.Tensor, seg: list[int], k: int = K_EIG, scale: bool = SCALE,
-                  sign_mode: str = SIGN_MODE, device: str | torch.device = DEVICE,
-                  cs: CumulativeSpectral | None = None,
-                  out_device: str | torch.device = "cpu") -> Iterator[TokenRecord]:
-    """토큰열 E (n x d) 를 seg 경계마다 리셋하며 토큰 단위로 흘려보낸다.
-
-    seg = [0, b1, ..., n] (extract.gen_view 의 seg 와 같은 규약). 어떤 경계든
-    받는다 — 텍스트 step 경계 대신 GSBS 경계를 넣어 리셋 지점을 바꿔 볼 수도 있다
-    (metric/gsbs.py 의 reset 그림).
-
-    cs 를 넘기면 그 톱니를 재사용한다 (버퍼 재할당 없이 여러 에피소드를 돌릴 때).
-    """
-    if seg[0] != 0 or seg[-1] != E.shape[0] or any(a >= b for a, b in zip(seg, seg[1:])):
-        raise ValueError(f"bad seg {seg} for E of {E.shape[0]} tokens")
-    if cs is None:
-        cs = CumulativeSpectral(k, scale, sign_mode, device)
-    idx = 0
-    for t, (s, en) in enumerate(zip(seg, seg[1:])):
-        cs.reset()
-        n = en - s
-        for pos, (e, lam, score) in enumerate(cs.feed(E[s:en])):
-            yield TokenRecord(idx=idx, seg=t, pos=pos, reset=(pos == 0), last=(pos == n - 1),
-                              e=e.to(out_device), lam=lam.to(out_device),
-                              score=None if score is None else score.to(out_device))
-            idx += 1
-
-
-@torch.no_grad()
-def stream_episode(episode: dict, k: int = K_EIG, scale: bool = SCALE,
-                   sign_mode: str = SIGN_MODE, device: str | torch.device = DEVICE,
-                   cs: CumulativeSpectral | None = None,
-                   out_device: str | torch.device = "cpu") -> Iterator[TokenRecord]:
-    """에피소드 하나(extract 청크의 dict)를 토큰 단위로. 프롬프트는 빼고 step 경계에서 리셋."""
-    E, seg = gen_view(episode)
-    yield from stream_tokens(E, seg, k, scale, sign_mode, device, cs, out_device)
-
-
 @torch.no_grad()
 def tokens_cumulative(E: torch.Tensor, seg: list[int], k: int = K_EIG, scale: bool = SCALE,
                       sign_mode: str = SIGN_MODE, device: str | torch.device = DEVICE,
                       cs: CumulativeSpectral | None = None,
                       out_dtype: torch.dtype = torch.float32):
-    """stream_tokens 를 (n x kd) 텐서로 모은다. 반환 (e_all, lam_all).
+    """토큰열 E (n x d) 를 seg 경계마다 리셋하며 토큰 전부의 누적 e 를 (n x kd) 로 모은다.
+    반환 (e_all, lam_all (n x k)).
 
-    heatmap.py / gsbs.py 처럼 토큰 전체 행렬이 필요한 곳용. RSSM 학습 배치도 여기서
-    나온 e_all 을 시퀀스로 쓰면 된다. 메모리: n·k·d·(dtype 바이트). k=8, 600
-    토큰이면 float32 ≈ 98MB, bf16 ≈ 49MB — 에피소드 하나 단위로만 들고 있을 것.
+    seg = [0, b1, ..., n] (extract.gen_view 규약). 어떤 경계든 받는다 — step 경계 대신
+    GSBS 경계를 넣어 리셋 지점을 바꿔 볼 수도 있다. heatmap.py / gsbs_batch.py 처럼 토큰
+    전체 행렬이 필요한 곳용이고 파일은 만들지 않는다. 메모리: n·k·d·(dtype 바이트),
+    k=8 / 600 토큰이면 float32 ≈ 98MB — 에피소드 하나 단위로만 들고 있을 것.
+    cs 를 넘기면 그 누적기를 재사용한다 (버퍼 재할당 없이 여러 에피소드를 돌릴 때).
     """
     n, d = E.shape
+    if seg[0] != 0 or seg[-1] != n or any(a >= b for a, b in zip(seg, seg[1:])):
+        raise ValueError(f"bad seg {seg} for E of {n} tokens")
+    if cs is None:
+        cs = CumulativeSpectral(k, scale, sign_mode, device)
+    elif (cs.k, cs.scale, cs.sign_mode) != (k, scale, sign_mode):
+        raise ValueError(f"cs config {(cs.k, cs.scale, cs.sign_mode)} != {(k, scale, sign_mode)}")
     e_all = torch.empty(n, k * d, dtype=out_dtype)
     lam_all = torch.empty(n, k, dtype=torch.float32)
-    for rec in stream_tokens(E, seg, k, scale, sign_mode, device, cs):
-        e_all[rec.idx] = rec.e.to(out_dtype)
-        lam_all[rec.idx] = rec.lam
+    for s, en in zip(seg, seg[1:]):
+        cs.reset()
+        for i, (e, lam, _) in enumerate(cs.feed(E[s:en])):
+            e_all[s + i] = e.to("cpu", out_dtype)
+            lam_all[s + i] = lam.cpu()
+    cs.reset()
     return e_all, lam_all
 
 
-@torch.no_grad()
-def episode_cumulative(episode: dict, k: int = K_EIG, scale: bool = SCALE,
-                       sign_mode: str = SIGN_MODE, device: str | torch.device = DEVICE,
-                       cs: CumulativeSpectral | None = None,
-                       out_dtype: torch.dtype = torch.float32):
-    """에피소드 하나를 통째로 (n_gen x kd) 텐서로. 반환 (e_all, lam_all, seg)."""
-    E, seg = gen_view(episode)
-    e_all, lam_all = tokens_cumulative(E, seg, k, scale, sign_mode, device, cs, out_dtype)
-    return e_all, lam_all, seg
+# ------------------------------------------------------------------ 마커 길이
 
-
-# --------------------------------------------------------------- 데이터셋 단위
-
-@dataclass
-class EpisodeItem:
-    task: str
-    level: str
-    status: str
-    seed: int
-    chunk: str          # chunk 파일명
-    seg: list[int]      # gen_view 경계 [0, step1 끝, …, stepN 끝, 전체 끝]
-    labels: list[str]   # seg_labels(seg)
-    e: torch.Tensor     # (n_gen x kd)
-    lam: torch.Tensor   # (n_gen x k)
-
-
-@torch.no_grad()
-def stream_dataset(hidden_dir: Path, task: str, level: str, status: str,
-                   k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
-                   device: str | torch.device = DEVICE, seeds: set[int] | None = None,
-                   limit: int | None = None, out_dtype: torch.dtype = torch.float32,
-                   per_token: bool = False):
-    """<hidden_dir>/<task>/<level>/<status>/chunk_*.pt 를 읽어 에피소드마다 e 를 흘려보낸다.
-
-    per_token=False (기본): EpisodeItem 을 yield — e (n_gen x kd) 한 덩어리.
-    per_token=True        : (seed, TokenRecord) 를 토큰마다 yield — 메모리 최소.
-
-    파일을 만들지 않는다. chunk 는 하나씩만 메모리에 올리고, 다음 chunk 로 넘어가면 버린다.
-    """
-    hidden_dir = Path(hidden_dir).resolve()
-    chunk_files = load_hidden_states(hidden_dir, task, level, status)
-    cs = CumulativeSpectral(k, scale, sign_mode, device)
-    n_done = 0
-    for cf in chunk_files:
-        chunk = load_chunk(cf)
-        for seed, episode in chunk.items():
-            if seeds is not None and seed not in seeds:
-                continue
-            if limit is not None and n_done >= limit:
-                return
-            if per_token:
-                for rec in stream_episode(episode, k, scale, sign_mode, device, cs):
-                    yield seed, rec
-            else:
-                e_all, lam_all, seg = episode_cumulative(
-                    episode, k, scale, sign_mode, device, cs, out_dtype)
-                yield EpisodeItem(task=task, level=level, status=status, seed=seed,
-                                  chunk=cf.name, seg=seg, labels=seg_labels(seg),
-                                  e=e_all, lam=lam_all)
-            n_done += 1
-        del chunk
-
-
-# ------------------------------------------------------------- 3. 가장자리 e
-
-def load_sources(traj_dir: Path, task: str) -> dict:
-    """(env_name, env_seed, output_sha1) → jsonl 에피소드."""
+def load_sources(traj_dir: Path, task: str, mode: str = "no_thinking") -> dict:
+    """(env_name, env_seed, output_sha1) → jsonl 에피소드. 파일이 없으면 빈 dict."""
+    path = traj_dir / f"{task}_{mode}.jsonl"
+    if not path.is_file():
+        print(f"warning: {path} 없음 — marker 를 텍스트로 못 세니 fallback 만 쓴다", file=sys.stderr)
+        return {}
     out = {}
-    for ep in load_episodes(traj_dir / f"{task}_no_thinking.jsonl"):
+    for ep in load_episodes(path):
         text = ep.get("all_llm_output") or ""
         sha = hashlib.sha1(text.encode()).hexdigest()
         out[(ep["env_name"], int(ep["env_seed"]), sha)] = ep
@@ -533,7 +341,7 @@ def load_sources(traj_dir: Path, task: str) -> dict:
 def marker_lengths(src_ep: dict, task: str, boundaries: list[int]):
     """구간별 형식 토큰 수 [m_step1, ..., m_stepN, m_terminal]. 실패 시 (None, 사유).
 
-    extract.tok 이 세팅되어 있어야 한다 (CLI `edges` 가 AutoTokenizer 를 넣어 준다)."""
+    extract.tok 이 세팅되어 있어야 한다 (ensure_tokenizer)."""
     prompt = extract.render_prompt(src_ep)
     text = src_ep["all_llm_output"]
     enc = extract.tok(prompt + text, add_special_tokens=False, return_offsets_mapping=True)
@@ -563,6 +371,24 @@ def marker_lengths(src_ep: dict, task: str, boundaries: list[int]):
     return marks, None
 
 
+def ensure_tokenizer():
+    if extract.tok is None:
+        from transformers import AutoTokenizer
+        extract.tok = AutoTokenizer.from_pretrained(MODEL)
+
+
+def parse_fallback(items: list[str]) -> dict[str, tuple[int, int]]:
+    """CLI 의 --fallback-marker TASK=S:T 목록 → {task: (S, T)}."""
+    out = {}
+    for kv in items:
+        task_, v = kv.split("=")
+        st, te = v.split(":")
+        out[task_] = (int(st), int(te))
+    return out
+
+
+# ------------------------------------------------------------ 에피소드 레코드
+
 def edge_positions(n: int, marker: int, n_front: int, n_back: int):
     """구간 길이 n 에서 front/back 위치. 짧으면 겹칠 수 있고, 모자라면 있는 만큼만."""
     front = list(range(min(marker, n), min(marker + n_front, n)))
@@ -571,262 +397,182 @@ def edge_positions(n: int, marker: int, n_front: int, n_back: int):
 
 
 @torch.no_grad()
-def episode_edges(episode: dict, marks: list[int], cs: CumulativeSpectral,
-                  n_front: int, n_back: int, marker_src: str = "text") -> dict:
+def episode_record(episode: dict, marks: list[int], cs: CumulativeSpectral,
+                   n_front: int, n_back: int, marker_src: str) -> dict:
+    """에피소드 하나 → 저장 레코드 (모듈 docstring 의 episodes[seed] 형식)."""
     E, seg = gen_view(episode)
+    k, kd = cs.k, cs.k * E.shape[1]
     rec = {"seg": seg, "labels": seg_labels(seg), "marker": marks, "marker_src": marker_src,
-           "front": {}, "front_pos": {}, "back": {}, "back_pos": {}}
-    kd = cs.k * E.shape[1]
+           "front": {}, "front_pos": {}, "front_lam": {},
+           "back": {}, "back_pos": {}, "back_lam": {}}
     for t, (s, e) in enumerate(zip(seg, seg[1:])):
-        n = e - s
-        fpos, bpos = edge_positions(n, marks[t], n_front, n_back)
+        fpos, bpos = edge_positions(e - s, marks[t], n_front, n_back)
         need = sorted(set(fpos) | set(bpos))
         cs.reset()
-        got = dict(zip(need, (r[0].cpu() for r in cs.feed_at(E[s:e], need))))
+        got = {p: (r[0].cpu(), r[1].cpu()) for p, r in zip(need, cs.feed_at(E[s:e], need))}
         cs.reset()
-        stack = lambda ps: torch.stack([got[p] for p in ps]) if ps else torch.empty(0, kd)
-        rec["front"][t], rec["front_pos"][t] = stack(fpos), fpos
-        rec["back"][t], rec["back_pos"][t] = stack(bpos), bpos
+        for side, ps in (("front", fpos), ("back", bpos)):
+            rec[side][t] = torch.stack([got[p][0] for p in ps]) if ps else torch.empty(0, kd)
+            rec[f"{side}_lam"][t] = torch.stack([got[p][1] for p in ps]) if ps else torch.empty(0, k)
+            rec[f"{side}_pos"][t] = ps
     return rec
 
 
-# ------------------------------------------------------------------- 검증
-
-def _close(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) -> bool:
-    """‖a − b‖ ≤ atol + rtol‖b‖ (b 가 기준)."""
-    return (a - b).norm().item() <= atol + rtol * b.norm().item()
+def segment_last(rec: dict) -> dict[int, torch.Tensor]:
+    """레코드에서 구간 마지막 e_t 사전 {t: (kd,)}. n_back ≥ 1 로 저장한 파일이어야 한다."""
+    return {t: B[-1] for t, B in rec["back"].items() if len(B)}
 
 
-def verify_edges(rec: dict, spec_path: Path, seed, atol=1e-3, rtol=1e-3) -> tuple[int, int]:
-    """episode_edges 의 back 마지막 e == spectral_run 이 저장한 구간 e_t 인지. (일치, 불일치)"""
-    if not spec_path.is_file():
-        return 0, 0
-    ref = torch.load(spec_path, map_location="cpu", weights_only=False)["episodes"].get(seed)
-    if ref is None:
-        return 0, 0
-    ok = bad = 0
-    for t, B in rec["back"].items():
-        a, b = B[-1].float(), ref["e"][t].float()
-        k = len(ref["eigvals"][t])
-        # 성분별로 비교 — 부호가 임의인 성분(고유값이 거의 같은 쌍)은 뒤집혀도 허용
-        for A_j, B_j in zip(a.reshape(k, -1), b.reshape(k, -1)):
-            if _close(A_j, B_j, atol, rtol) or _close(-A_j, B_j, atol, rtol):
-                ok += 1
-            else:
-                bad += 1
-    return ok, bad
+# ------------------------------------------------------------------- 저장 실행
+
+def load_hidden_states(data_dir: Path, task: str, level: str, status: str):
+    """extract.py 출력 경로: <data_dir>/<task>/<level>/<status>/chunk_*.pt"""
+    target = data_dir / task / level / status
+    if not target.is_dir():
+        raise FileNotFoundError(f"no such directory: {target}")
+
+    files = sorted(target.glob("chunk_*.pt"))
+    if not files:
+        raise FileNotFoundError(f"no chunk_*.pt in {target}")
+    return files
+
+
+Config = tuple[int, bool, str]      # (k, scale, sign_mode)
 
 
 @torch.no_grad()
-def verify_episode(episode: dict, k: int, scale: bool, sign_mode: str,
-                   device=DEVICE, rtol: float = 1e-3, atol: float = 1e-3,
-                   every_token: bool = True) -> dict:
-    """스트리밍(그람) 결과를 spectral_embedding(SVD) 과 맞춰 본다.
+def process_chunk(cf: Path, task: str, level: str, status: str, out_root: Path,
+                  configs: list[Config], n_front: int, n_back: int,
+                  sources: dict | None = None, fallback: dict | None = None,
+                  device: str | torch.device = DEVICE, overwrite: bool = False,
+                  stats: Counter | None = None) -> Counter:
+    """hidden_states 청크 하나를 읽어 configs 마다 저장 파일 하나씩 쓴다.
 
-    - 구간 마지막 토큰의 e_i == spectral_embedding(E_t)  (spectral_run 과 동일해야 함)
-    - every_token 이면 토큰마다 spectral_embedding(E[s:i+1]) 을 다시 돌려서 전부 비교
-      (느리다: 토큰마다 (i x d) SVD)
+    청크를 한 번만 메모리에 올리고 marker 도 한 번만 세서 여러 (k, scale, sign_mode) 에 재사용한다.
+    overwrite=False 면 이미 있는 출력은 건너뛴다."""
+    stats = Counter() if stats is None else stats
+    out_of = {c: out_root / task / level / status / make_tag(*c, n_front, n_back) / cf.name for c in configs}
+    todo = [c for c in configs if overwrite or not out_of[c].exists()]
+    if not todo:
+        stats["chunk_skipped"] += 1
+        return stats
+    d = torch.load(cf, map_location="cpu", weights_only=False)
 
-    비교는 e = σv 에 대해 상대 오차로 한다. 부호 보정이 애매한 성분(score≈0,
-    또는 σ 가 거의 같은 두 고유값)은 원래 부호가 임의라 따로 센다.
-    """
-    E, seg = gen_view(episode)
-    n_ok = n_bad = n_amb = 0
-    worst = 0.0
-    for rec in stream_episode(episode, k, scale, sign_mode, device):
-        s = seg[rec.seg]
-        if not (every_token or rec.last):
+    marks_of: dict = {}                                          # seed → (marks, marker_src)
+    for seed, ep in d["episodes"].items():
+        n_seg = len(ep["boundaries"]) - 2                        # step N 개 + 터미널
+        if n_front == 0:                                         # marker 불필요
+            marks_of[seed] = ([0] * n_seg, "none")
             continue
-        e_ref, lam_ref, _, _ = spectral_embedding(E[s: s + rec.pos + 1].to(device), k, scale, sign_mode)
-        R, Rr = rec.e.reshape(k, -1), e_ref.reshape(k, -1)
-        for j in range(k):
-            rel = (R[j] - Rr[j]).norm().item() / max(Rr[j].norm().item(), EPS)
-            if _close(R[j], Rr[j], atol, rtol):
-                n_ok += 1
-                worst = max(worst, rel)
+        src = (sources or {}).get((level, int(seed), ep["output_sha1"]))
+        if src is None:
+            if not fallback or task not in fallback:
+                stats["no_source"] += 1
                 continue
-            # 부호만 다른가? (부호 결정이 임의였던 성분)
-            close_eig = j + 1 < k and abs(lam_ref[j] - lam_ref[j + 1]) < 1e-3 * max(lam_ref[j].item(), EPS)
-            if _close(-R[j], Rr[j], atol, rtol) or close_eig:
-                n_amb += 1
-            else:
-                n_bad += 1
-                worst = max(worst, rel)
-    return {"n_ok": n_ok, "n_sign_ambiguous": n_amb, "n_bad": n_bad, "worst_rel": worst}
+            st, te = fallback[task]
+            marks_of[seed] = ([st] * (n_seg - 1) + [te], "fixed")
+            stats["marker_fixed"] += 1
+            continue
+        ensure_tokenizer()
+        marks, reason = marker_lengths(src, task, ep["boundaries"])
+        if reason:
+            stats[reason] += 1
+            continue
+        marks_of[seed] = (marks, "text")
+        stats["marker_text"] += 1
+        for m in marks[:-1]:
+            stats[f"hist_step_marker_{m}"] += 1
+        stats[f"hist_term_marker_{marks[-1]}"] += 1
+
+    for c in todo:
+        k, scale, sm = c
+        cs = CumulativeSpectral(k, scale, sm, device)
+        eps = {}
+        for seed, (marks, msrc) in marks_of.items():
+            eps[seed] = episode_record(d["episodes"][seed], marks, cs, n_front, n_back, msrc)
+        out = out_of[c]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"k": k, "scale": scale, "sign_mode": sm,
+                    "n_front": n_front, "n_back": n_back,
+                    "src": str(cf), "model": d.get("model", MODEL), "episodes": eps}, out)
+        stats["files"] += 1
+        stats["episodes"] += len(eps)
+    return stats
+
+
+@torch.no_grad()
+def spectral_run(hidden_dir: Path, out_root: Path, task: str, level: str, status: str,
+                 configs: list[Config], n_front: int = N_FRONT, n_back: int = N_BACK,
+                 traj_dir: Path | None = None, mode: str = "no_thinking",
+                 fallback: dict | None = None, device: str | torch.device = DEVICE,
+                 overwrite: bool = False) -> Counter:
+    """한 (task, level, status) 의 모든 청크를 configs 마다 저장한다. 반환: 집계 Counter.
+
+    n_front > 0 이면 traj_dir 의 원본 jsonl 로 marker 를 센다 (없으면 fallback).
+    overwrite=True 면 출력 디렉토리의 낡은 chunk 파일도 지운다 (hidden_states 청크 수가 줄었을 때)."""
+    hidden_dir = Path(hidden_dir).resolve()
+    chunk_files = load_hidden_states(hidden_dir, task, level, status)
+    sources = None
+    if n_front > 0 and traj_dir is not None:
+        sources = load_sources(Path(traj_dir), task, mode)
+
+    if overwrite:
+        for c in configs:
+            out_dir = out_root / task / level / status / make_tag(*c, n_front, n_back)
+            for old in out_dir.glob("chunk_*.pt"):
+                old.unlink()
+
+    stats = Counter()
+    desc = f"{task}/{level}/{status} f{n_front}_b{n_back} x{len(configs)}"
+    for cf in tqdm(chunk_files, desc=desc, unit="chunk"):
+        process_chunk(cf, task, level, status, out_root, configs, n_front, n_back,
+                      sources, fallback, device, overwrite, stats)
+    return stats
 
 
 # ------------------------------------------------------------------------ CLI
 
-def _parse_bool(s: str) -> bool:
-    return s == "true"
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--task", nargs="+", default=list(TASKS), choices=TASKS)
+    ap.add_argument("--level", nargs="+", default=None, help="기본: hidden_states 에 있는 전부")
+    ap.add_argument("--status", nargs="+", default=["success", "failure"], choices=["success", "failure"])
+    ap.add_argument("-k", type=int, nargs="+", default=[K_EIG], help="고유벡터 개수 k (여러 개 가능)")
+    ap.add_argument("--scale", nargs="+", default=["true" if SCALE else "false"], choices=["true", "false"],
+                    help="E/√n 스케일 (여러 개 가능)")
+    ap.add_argument("--sign-mode", nargs="+", default=[SIGN_MODE], choices=list(SIGN_MODES),
+                    help="부호 보정 규칙 (여러 개 가능)")
+    ap.add_argument("--n-front", type=int, default=N_FRONT, help="구간 앞(형식 문구 뒤)에서 저장할 토큰 수")
+    ap.add_argument("--n-back", type=int, default=N_BACK, help="구간 뒤에서 저장할 토큰 수 (1 = 마지막 e_t 만)")
+    ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
+    ap.add_argument("--traj-dir", type=Path, default=ROOT / "generation" / "trajectory",
+                    help="marker 를 셀 원본 jsonl 위치 (--n-front > 0 일 때만 쓴다)")
+    ap.add_argument("--mode", default="no_thinking", choices=["no_thinking", "thinking"],
+                    help="원본 jsonl 이름: <traj-dir>/<task>_<mode>.jsonl")
+    ap.add_argument("--out-dir", type=Path, default=ROOT / "latent" / "spectral")
+    ap.add_argument("--device", default=DEVICE)
+    ap.add_argument("--fallback-marker", nargs="+", default=[], metavar="TASK=S:T",
+                    help="원본 텍스트가 없을 때 쓸 태스크별 형식 토큰 수. "
+                         "S=step 헤더, T=터미널 문구 (예: predict=5:7)")
+    ap.add_argument("--overwrite", action="store_true", help="이미 있는 출력도 다시 만든다")
+    a = ap.parse_args()
 
-
-def main_stream(a):
-    """토큰 단위 스트리밍을 한 (task, level, status) 에 돌려 보고, --verify 면 SVD 와 대조."""
-    scale = _parse_bool(a.scale)
+    configs = [(k, s == "true", sm) for k in a.k for s in a.scale for sm in a.sign_mode]
+    fallback = parse_fallback(a.fallback_marker)
+    total = Counter()
     t0 = time.time()
-    n_ep = n_tok = 0
-    for item in stream_dataset(a.hidden_dir, a.task, a.level, a.status,
-                               k=a.k, scale=scale, sign_mode=a.sign_mode, limit=a.limit):
-        n_ep += 1
-        n_tok += item.e.shape[0]
-        print(f"seed={item.seed:<6} n_gen={item.e.shape[0]:<5} segs={len(item.seg) - 1} "
-              f"e={tuple(item.e.shape)} top-λ(last tok)={item.lam[-1, 0]:.3g}")
-    dt = time.time() - t0
-    print(f"{n_ep} episodes, {n_tok} tokens, {dt:.1f}s  ({n_tok / max(dt, 1e-9):.0f} tok/s, device={DEVICE})")
-
-    if a.verify:
-        chunk_files = load_hidden_states(a.hidden_dir.resolve(), a.task, a.level, a.status)
-        n_done = 0
-        for cf in chunk_files:
-            for seed, ep in load_chunk(cf).items():
-                if a.limit is not None and n_done >= a.limit:
-                    break
-                t1 = time.time()
-                r = verify_episode(ep, a.k, scale, a.sign_mode,
-                                   every_token=not a.verify_last_only)
-                print(f"verify seed={seed}: {r}  ({time.time() - t1:.1f}s)")
-                if r["n_bad"]:
-                    raise SystemExit(f"MISMATCH seed={seed}: {r}")
-                n_done += 1
-        print("verify OK")
-
-
-def main_edges(a):
-    """모든 (task, level, status, chunk) 에 대해 가장자리 e 를 저장한다."""
-    from transformers import AutoTokenizer
-
-    scale = _parse_bool(a.scale)
-    fallback = {}
-    for kv in a.fallback_marker:                                 # TASK=S:T
-        task_, v = kv.split("=")
-        st, te = v.split(":")
-        fallback[task_] = (int(st), int(te))
-
-    extract.tok = AutoTokenizer.from_pretrained(MODEL)
-    configs = [(k, sm) for k in a.k for sm in a.sign_mode]
-    stats = Counter()
-    marker_hist, term_hist = Counter(), Counter()
-    t0 = time.time()
-
     for task in a.task:
-        sources = load_sources(a.traj_dir, task)
         levels = a.level or sorted(p.name for p in (a.hidden_dir / task).iterdir() if p.is_dir())
         for level in levels:
             for status in a.status:
-                hdir = a.hidden_dir / task / level / status
-                if not hdir.is_dir():
+                if not (a.hidden_dir / task / level / status).is_dir():
                     continue
-                for cf in sorted(hdir.glob("chunk_*.pt")):
-                    todo = [(k, sm) for k, sm in configs
-                            if a.overwrite or not (a.out_dir / task / level / status
-                                                   / make_tag(k, scale, sm) / cf.name).exists()]
-                    if not todo:
-                        print(f"[skip] {task}/{level}/{status}/{cf.name}: 이미 있음")
-                        continue
-                    d = torch.load(cf, map_location="cpu", weights_only=False)
-
-                    marks_of = {}
-                    for seed, ep in d["episodes"].items():
-                        src = sources.get((level, int(seed), ep["output_sha1"]))
-                        if src is None:
-                            if task not in fallback:
-                                stats["no_source"] += 1
-                                continue
-                            n_steps = len(ep["boundaries"]) - 3
-                            st, te = fallback[task]
-                            marks_of[seed] = ([st] * n_steps + [te], "fixed")
-                            stats["marker_fixed"] += 1
-                            continue
-                        marks, reason = marker_lengths(src, task, ep["boundaries"])
-                        if reason:
-                            stats[reason] += 1
-                            continue
-                        marks_of[seed] = (marks, "text")
-                        stats["marker_text"] += 1
-                        marker_hist.update(marks[:-1])
-                        term_hist.update(marks[-1:])
-
-                    for k, sm in todo:
-                        tag = make_tag(k, scale, sm)
-                        cs = CumulativeSpectral(k, scale, sm, a.device)
-                        eps = {}
-                        for seed, (marks, msrc) in marks_of.items():
-                            eps[seed] = episode_edges(d["episodes"][seed], marks, cs,
-                                                      a.n_front, a.n_back, msrc)
-                            if a.verify:
-                                ok, bad = verify_edges(eps[seed], a.spectral_dir / task / level / status
-                                                       / tag / cf.name, seed)
-                                stats[f"verify_ok_{tag}"] += ok
-                                stats[f"verify_bad_{tag}"] += bad
-                        out = a.out_dir / task / level / status / tag / cf.name
-                        out.parent.mkdir(parents=True, exist_ok=True)
-                        torch.save({"k": k, "scale": scale, "sign_mode": sm,
-                                    "n_front": a.n_front, "n_back": a.n_back,
-                                    "src": str(cf), "model": d.get("model", MODEL),
-                                    "episodes": eps}, out)
-                        stats[f"episodes_{tag}"] += len(eps)
-                        print(f"{task}/{level}/{status}/{tag}/{cf.name}: {len(eps)} eps "
-                              f"({time.time() - t0:.0f}s)")
-                    del d
-
-    print(f"\nstats: {dict(stats)}")
-    print(f"marker 토큰 수 분포 (텍스트로 센 step 구간): {dict(sorted(marker_hist.items()))}")
-    print(f"marker 토큰 수 분포 (텍스트로 센 터미널 구간): {dict(sorted(term_hist.items()))}")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    # -- stream: 토큰 단위 스트리밍 확인 / SVD 대조 ---------------------------
-    s = sub.add_parser("stream", help="토큰 단위 누적 e 를 한 (task, level, status) 에 흘려 보기 / --verify",
-                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    s.add_argument("--task", required=True, choices=TASKS)
-    s.add_argument("--level", required=True)
-    s.add_argument("--status", default="success", choices=["success", "failure"])
-    s.add_argument("-k", type=int, default=K_EIG)
-    s.add_argument("--scale", default="true" if SCALE else "false", choices=["true", "false"])
-    s.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES))
-    s.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
-    s.add_argument("--limit", type=int, default=None, help="에피소드 개수 제한")
-    s.add_argument("--verify", action="store_true",
-                   help="spectral_embedding(SVD) 과 토큰마다 비교 (느림)")
-    s.add_argument("--verify-last-only", action="store_true",
-                   help="--verify 를 구간 마지막 토큰(e_t)에서만")
-    s.set_defaults(func=main_stream)
-
-    # -- edges: 가장자리 e 저장 ------------------------------------------------
-    e = sub.add_parser("edges", help="구간마다 앞/뒤 가장자리 토큰의 누적 e 를 저장 (probing 입력)",
-                       formatter_class=argparse.RawDescriptionHelpFormatter)
-    e.add_argument("--task", nargs="+", default=list(TASKS), choices=TASKS)
-    e.add_argument("--level", nargs="+", default=None, help="기본: hidden_states 에 있는 전부")
-    e.add_argument("--status", nargs="+", default=["success", "failure"])
-    e.add_argument("-k", type=int, nargs="+", default=[K_EIG], help="고유벡터 개수 k (여러 개 가능)")
-    e.add_argument("--sign-mode", nargs="+", default=[SIGN_MODE], choices=list(SIGN_MODES),
-                   help="부호 보정 규칙 (여러 개 가능)")
-    e.add_argument("--scale", default="true" if SCALE else "false", choices=["true", "false"],
-                   help="E/√n 스케일 (spectral_states 는 true)")
-    e.add_argument("--n-front", type=int, default=5)
-    e.add_argument("--n-back", type=int, default=5)
-    e.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
-    e.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
-    e.add_argument("--traj-dir", type=Path, default=ROOT / "generation" / "trajectory")
-    e.add_argument("--out-dir", type=Path, default=ROOT / "latent" / "spectral_edges")
-    e.add_argument("--device", default=DEVICE)
-    e.add_argument("--verify", action="store_true",
-                   help="back 마지막 e 를 spectral_states 의 구간 e_t 와 비교")
-    e.add_argument("--fallback-marker", nargs="+", default=[], metavar="TASK=S:T",
-                   help="원본 텍스트가 없을 때 쓸 태스크별 형식 토큰 수. "
-                        "S=step 헤더, T=터미널 문구 (예: predict=5:7)")
-    e.add_argument("--overwrite", action="store_true")
-    e.set_defaults(func=main_edges)
-    return ap
-
-
-def main():
-    a = build_parser().parse_args()
-    a.func(a)
+                stats = spectral_run(a.hidden_dir, a.out_dir, task, level, status, configs,
+                                     a.n_front, a.n_back, a.traj_dir, a.mode, fallback,
+                                     a.device, a.overwrite)
+                print(f"{task}/{level}/{status}: {dict(stats)}  ({time.time() - t0:.0f}s)")
+                total.update(stats)
+    print(f"\ntotal: {dict(total)}")
 
 
 if __name__ == "__main__":

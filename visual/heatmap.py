@@ -3,7 +3,7 @@
 5-1(spectral.py, 구간당 그람 1개)과 다르게, 토큰이 하나 생성될 때마다 "현재
 구간의 첫 토큰부터 지금 토큰까지"만 다시 누적해서 그람을 계산한다 (에피소드
 전체 누적이 아니라 구간 경계에서 리셋). 그러니 각 구간의 "마지막 토큰" 시점만
-뽑으면 5-1의 구간당 e_t와 정확히 같아야 한다 — spectral_states가 있으면 그것과
+뽑으면 5-1의 구간당 e_t와 정확히 같아야 한다 — latent/spectral 저장본이 있으면 그것과
 비교해서 검증까지 한다.
 
 구간은 extract.gen_view 기준이다. 프롬프트는 빼고 step 1..N + 터미널(정답 문장).
@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT / "inference"))
 
 from extract import load_chunk, gen_view, seg_labels                    # noqa: E402
 from spectral import (make_tag, DEVICE, K_EIG, SCALE, SIGN_MODE, SIGN_MODES,  # noqa: E402
-                      tokens_cumulative)
+                      N_FRONT, N_BACK, tokens_cumulative, segment_last)
 
 
 @torch.no_grad()
@@ -51,7 +51,7 @@ def cumulative_within_step(E: torch.Tensor, boundaries: list[int],
 
 def verify_against_spectral_states(last_of_step: dict, spectral_e: dict,
                                    rtol: float = 1e-3, atol: float = 1e-3):
-    """spectral_states의 e_t(5-1)와 각 구간 마지막 토큰의 e_i(5-2)가 실제로
+    """저장된 spectral 의 e_t(5-1, back[t][-1])와 각 구간 마지막 토큰의 e_i(5-2)가 실제로
     같은지 확인. 다르면 구현 버그.
 
     5-1 은 (n x d) SVD, 5-2 는 (n x n) 그람 eigh 라 float32 반올림 수준(상대 1e-4)
@@ -99,6 +99,7 @@ def plot_heatmap(sim: torch.Tensor, seg: list[int], out_path: Path, title: str):
 
 def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None = None,
         k: int = K_EIG, scale: bool = SCALE, sign_mode: str = SIGN_MODE,
+        n_front: int = N_FRONT, n_back: int = N_BACK,
         spectral_dir: Path | None = None, rep: str = "spectral"):
     h_dir = hidden_dir / task / level / status
     chunk_files = sorted(h_dir.glob("chunk_*.pt"))
@@ -127,11 +128,11 @@ def run(hidden_dir: Path, task: str, level: str, status: str, seed: int | None =
     e_all, last_of_step = cumulative_within_step(E, seg, k, scale, sign_mode)
 
     if spectral_dir is not None:
-        spectral_tag = make_tag(k, scale, sign_mode)   # spectral.py 와 같은 규칙으로 디렉토리명 생성
+        spectral_tag = make_tag(k, scale, sign_mode, n_front, n_back)   # spectral.py 와 같은 규칙
         s_path = spectral_dir / task / level / status / spectral_tag / chunk_name
         if s_path.exists():
             spectral_e = torch.load(s_path, map_location="cpu", weights_only=False)
-            spectral_e = spectral_e["episodes"][seed]["e"]
+            spectral_e = segment_last(spectral_e["episodes"][seed])
             verify_against_spectral_states(last_of_step, spectral_e)
         else:
             print(f"warning: {s_path} 없음 — 5-1 vs 5-2 검증 건너뜀 "
@@ -151,15 +152,17 @@ def main():
                     help="spectral=토큰별 누적 e_t 끼리 코사인(기본) | raw=원본 5120차원 토큰끼리 코사인")
     ap.add_argument("-k", type=int, default=K_EIG)
     ap.add_argument("--sign-mode", default=SIGN_MODE, choices=list(SIGN_MODES),
-                    help="spectral 과 같은 값을 줘야 spectral_states 검증이 맞물림")
+                    help="spectral 과 같은 값을 줘야 저장본 검증이 맞물림")
+    ap.add_argument("--n-front", type=int, default=N_FRONT, help="검증에 쓸 spectral 저장본의 n_front")
+    ap.add_argument("--n-back", type=int, default=N_BACK, help="검증에 쓸 spectral 저장본의 n_back (≥1)")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
-    ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral_states")
+    ap.add_argument("--spectral-dir", type=Path, default=ROOT / "latent" / "spectral")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "visual" / "heatmap")
     args = ap.parse_args()
 
     sim, seg, seed = run(args.hidden_dir, args.task, args.level, args.status,
-                         seed=args.seed, k=args.k,
-                         sign_mode=args.sign_mode, spectral_dir=args.spectral_dir,
+                         seed=args.seed, k=args.k, sign_mode=args.sign_mode,
+                         n_front=args.n_front, n_back=args.n_back, spectral_dir=args.spectral_dir,
                          rep=args.rep)
 
     # raw 는 k/부호와 무관하므로 raw/<status>/ 로 따로 둔다.
@@ -167,7 +170,7 @@ def main():
         tag = "raw"
         out_dir = args.out_dir / "raw" / args.status
     else:
-        tag = make_tag(args.k, SCALE, args.sign_mode)
+        tag = make_tag(args.k, SCALE, args.sign_mode, args.n_front, args.n_back)
         # 한 디렉토리에 다 쌓이면 못 찾는다 → k / status / 부호모드 로 3단 분리.
         # 파일명에는 전체 tag 를 남겨서 파일 하나만 떼어 봐도 설정을 알 수 있게 둔다.
         out_dir = args.out_dir / f"k{args.k}" / args.status / args.sign_mode

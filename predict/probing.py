@@ -25,10 +25,10 @@ boundaries 규약 (길이 N+3):
 
 입력 종류 (--source). 라벨은 모두 같다: 해당 구간이면 참, 다른 구간이면 거짓.
     hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
-    spectral [2] spectral_states 의 구간 전체 누적 e_t (구간마다 kd 벡터 하나).
-                 프롬프트 구간이 없으므로 --with-prompt/--offset 은 무시된다.
-    edges    [3-5] spectral_edges (`inference/spectral.py edges` 출력) 의 토큰별 누적 e_i.
-                 누적은 구간 시작에서 리셋되고, e_i 하나하나가 샘플이다.
+    spectral [2] latent/spectral 저장본의 구간 마지막 e_t (back[t][-1], 구간마다 kd 벡터 하나).
+                 n_back ≥ 1 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
+    edges    [3-5] 같은 저장본의 front/back 전부 (inference/spectral.py --n-front 5 --n-back 5).
+                 구간 안 토큰별 누적 e_i 로, 누적은 구간 시작에서 리셋되고 e_i 하나하나가 샘플이다.
                  --part both  [3] "Step N" 헤더 토큰을 뺀 앞 5개 + 마지막 5개
                  --part front [4] 헤더를 뺀 앞 5개
                  --part back  [5] 마지막 5개 (맨 끝 하나 = [2] 의 e_t)
@@ -42,9 +42,9 @@ boundaries 규약 (길이 N+3):
 Usage:
     python probing.py --pt 'latent/hidden_states/plan/*/*/chunk_*.pt' --output out/plan_all
     python probing.py --source spectral \
-        --pt 'latent/spectral_states/*/*/*/k8_scaled_sign-data/chunk_*.pt' --output out/spec_all
+        --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_f0_b1/chunk_*.pt' --output out/spec_all
     python probing.py --source edges --part front \
-        --pt 'latent/spectral_edges/*/*/*/k8_scaled_sign-data/chunk_*.pt' --output out/edge_front
+        --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_f5_b5/chunk_*.pt' --output out/edge_front
     python probing.py --pt 'latent/hidden_states/plan/BabyAI-GoTo-v0/*/chunk_*.pt' \
         --output out/plan_goto --offset 1 --cv
 """
@@ -146,7 +146,7 @@ def _config_ok(d, p, k, sign_mode, seen, stats):
 
 
 def load_spectral(patterns, k=None, sign_mode=None):
-    """[2] spectral_states: 구간 전체를 누적한 e_t (구간마다 하나)."""
+    """[2] spectral: 구간 전체를 누적한 e_t = back[t][-1] (구간마다 하나)."""
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
     for p in _paths(patterns):
@@ -155,15 +155,19 @@ def load_spectral(patterns, k=None, sign_mode=None):
             continue
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "spectral", seed)
-            n_seg = len(ep["e"])
+            n_seg = len(ep["back"])
             stats["episodes"] += 1
-            for t in sorted(ep["e"]):
-                Xs.append(ep["e"][t].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+            for t in sorted(ep["back"]):
+                B = ep["back"][t]
+                if not len(B):
+                    stats["segment_too_short"] += 1
+                    continue
+                Xs.append(B[-1].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
 def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
-    """[3-5] spectral_edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
+    """[3-5] edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
 
     part: both (3) | front (4) | back (5). e_i 하나하나가 샘플이고 라벨은 그 구간.
 

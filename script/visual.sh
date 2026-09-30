@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # task x level x status 조합마다 visual/step_similarity.py를 돌린다. GPU/모델 필요
-# 없고 저장된 hidden_states/spectral_states만 읽으므로 inference.sh보다 훨씬 가볍다.
+# 없고 저장된 hidden_states/spectral 저장본만 읽으므로 inference.sh보다 훨씬 가볍다.
 #
 # 사용:
 #   ./visual.sh              # 백그라운드로 떨어지고 바로 셸로 돌아옴
