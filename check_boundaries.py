@@ -3,8 +3,9 @@
 모델은 안 태운다 (토크나이저만 필요). extract.py 와 같은 방식으로 토크나이즈한 뒤
   1. 특수 토큰의 offset 이 (0,0) 인지 실제 문자 범위인지
   2. 프롬프트/출력 경계가 토큰 단위로 정확히 갈리는지
-  3. 각 step 경계가 "Step N" 헤더 직전에 놓이는지
-를 눈으로 확인한다.
+  3. 각 step 경계가 (헤더 줄이 빠진) 스텝 본문 첫 토큰 앞에 놓이고 "Step N" 토큰이 남지 않았는지
+를 눈으로 확인한다. extract.prepare_output 이 "Step N" 헤더 줄을 입력에서 빼므로
+여기서도 같은 함수로 벗긴 텍스트를 토크나이즈한다.
 
     python check_boundaries.py generation/trajectory/decompose_no_thinking.jsonl
     python check_boundaries.py <jsonl> --task decompose --n 5
@@ -13,74 +14,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import sys
 from pathlib import Path
 
 from transformers import AutoTokenizer
 
-# ---- extract.py 에서 그대로 가져온 부분 (import 안 되는 환경도 있어서 복제) ----
-
-STEP_PAT = re.compile(r"(?mi)^(?:#+\s*|\*+\s*)?Step\s*(\d+)\s*[.:]")
-MAX_STEPS = 6
-
-_APOS = r"['’ʼ´`]"
-_SEP = r"[\s*_]+"
-TERMINAL_PAT = {
-    "plan": re.compile(
-        rf"(?i)the{_SEP}llm\s*{_APOS}?\s*s{_SEP}action{_SEP}sequence{_SEP}is\s*\**\s*:"),
-    "predict": re.compile(
-        rf"(?i)the{_SEP}agent\s*{_APOS}?\s*s{_SEP}final{_SEP}state{_SEP}is\s*\**\s*:"),
-    "decompose": re.compile(r"(?i)<+\s*start\s*>+"),
-}
-END_PAT = re.compile(r"(?i)<+\s*end\s*>+")
-
-
-def _line_start(text: str, i: int) -> int:
-    return text.rfind("\n", 0, i) + 1
-
-
-def step_char_bounds(text, task):
-    if not text.strip():
-        return None, "empty_output"
-    term_pat = TERMINAL_PAT[task]
-    marks = list(term_pat.finditer(text))
-    if not marks:
-        return None, "no_terminal_marker"
-    term = _line_start(text, marks[-1].start())
-    if task == "decompose":
-        ends = list(END_PAT.finditer(text, marks[-1].end()))
-        if not ends:
-            return None, "no_end_marker"
-        if text[ends[-1].end():].strip():
-            return None, "text_after_end"
-    heads = list(STEP_PAT.finditer(text))
-    if not heads:
-        return None, "no_step_header"
-    if text[:heads[0].start()].strip():
-        return None, "preamble"
-    nums = [int(m.group(1)) for m in heads]
-    if nums != list(range(1, len(nums) + 1)):
-        return None, "step_sequence_break"
-    if len(nums) > MAX_STEPS:
-        return None, "too_many_steps"
-    starts = [_line_start(text, m.start()) for m in heads]
-    starts[0] = 0
-    if starts[-1] >= term:
-        return None, "step_in_terminal"
-    bounds = starts + [term, len(text)]
-    if any(a >= b for a, b in zip(bounds, bounds[1:])):
-        return None, "empty_segment"
-    return bounds, None
-
-
-def char_to_token_bounds(char_bounds, offsets):
-    tok_bounds, k = [], 0
-    for cb in char_bounds:
-        while k < len(offsets) and offsets[k][0] < cb:
-            k += 1
-        tok_bounds.append(k)
-    return tok_bounds
-
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "inference"))
+from extract import prepare_output, char_to_token_bounds  # noqa: E402
 
 # ----------------------------------------------------------------- 점검 본체
 
@@ -90,18 +31,18 @@ def show(tok, episode, task, ctx=4):
         tokenize=False, add_generation_prompt=True,
         enable_thinking=bool(episode.get("thinking", False)),
     )
-    output = episode["all_llm_output"]
-    full = prompt + output
-
-    char_bounds, reason = step_char_bounds(output, task)
+    cleaned, reason = prepare_output(episode["all_llm_output"], task)
     if reason is not None:
         print(f"  [skip] {reason}")
         return
+    output, char_bounds = cleaned.text, cleaned.bounds      # 헤더 줄이 빠진 출력
+    full = prompt + output
 
     enc = tok(full, add_special_tokens=False, return_offsets_mapping=True)
     ids, offs = enc.input_ids, enc.offset_mapping
 
-    print(f"  tokens={len(ids)}  prompt_chars={len(prompt)}  output_chars={len(output)}")
+    print(f"  tokens={len(ids)}  prompt_chars={len(prompt)}  output_chars={len(output)}"
+          f"  (헤더 {cleaned.n_header_chars}자 제거)")
 
     # --- 1. 특수 토큰 offset 확인 -------------------------------------------
     special = tok.all_special_ids
@@ -119,16 +60,17 @@ def show(tok, episode, task, ctx=4):
         print(f"      idx={i:3d} {tok.decode([ids[i]])!r:26s} offset={offs[i]}")
 
     # --- 2. straddle 및 프롬프트 경계 ---------------------------------------
-    straddle = [(i, tok.decode([ids[i]]), offs[i])
-                for i, (s, e) in enumerate(offs) if s < len(prompt) < e]
-    print("\n  [2] 프롬프트/출력 이음매:")
-    if straddle:
-        i, s, o = straddle[0]
-        print(f"      STRADDLE! idx={i} {s!r} offset={o}  -> extract.py 가 이 궤적을 skip 함")
-    else:
-        print("      straddle 없음 (정상)")
-
     abs_bounds = [0] + [len(prompt) + b for b in char_bounds]
+    cuts = abs_bounds[1:-1]                      # 프롬프트 끝 + 각 스텝/터미널 시작
+    straddle = [(c, i, tok.decode([ids[i]]), offs[i])
+                for c in cuts for i, (s, e) in enumerate(offs) if s < c < e]
+    print("\n  [2] 경계 이음매 (프롬프트/출력, 스텝 사이):")
+    if straddle:
+        for c, i, s, o in straddle:
+            print(f"      STRADDLE! char={c} idx={i} {s!r} offset={o}  -> extract.py 가 이 궤적을 skip 함")
+    else:
+        print(f"      straddle 없음 (정상, 경계 {len(cuts)}개 검사)")
+
     tb = char_to_token_bounds(abs_bounds, offs)
 
     ok_len = tb[-1] == len(ids)
@@ -142,14 +84,18 @@ def show(tok, episode, task, ctx=4):
         print(f"        원본   끝 40자: {prompt[-40:]!r}")
 
     # --- 3. 각 경계 앞뒤 토큰 -----------------------------------------------
-    labels = ["prompt_end"] + [f"step{i+1}_start" for i in range(len(tb) - 3)] \
+    # tb[1] = 프롬프트 끝 = step1 시작, tb[2..] = step2..N 시작, 터미널 시작, 끝
+    labels = ["prompt_end"] + [f"step{i}_start" for i in range(2, len(tb) - 2)] \
              + ["terminal_start", "eos"]
-    print("\n  [3] 경계별 앞뒤 토큰:")
+    print("\n  [3] 경계별 앞뒤 토큰 (|| 오른쪽에 'Step' 이 보이면 헤더 제거가 실패한 것):")
     for lab, b in zip(labels, tb[1:]):
         lo, hi = max(0, b - ctx), min(len(ids), b + ctx)
         before = tok.decode(ids[lo:b])
         after = tok.decode(ids[b:hi])
         print(f"      {lab:16s} idx={b:5d} | ...{before!r} || {after!r}...")
+    leaked = [i for i in range(tb[1], len(ids)) if "step" in tok.decode([ids[i]]).lower()]
+    print(f"      출력 구간에 'step' 을 담은 토큰: {len(leaked)}개"
+          + (f"  idx={leaked[:8]}" if leaked else "  (헤더 제거 정상)"))
 
     # --- 4. 구간 길이 --------------------------------------------------------
     seg = [(labels[i - 1] if i else "prompt", tb[i + 1] - tb[i])

@@ -57,7 +57,7 @@ def parse_args():
     p.add_argument("--dtype", default="float32", choices=list(DTYPES), help="e 저장 dtype")
     p.add_argument("--fallback-marker", nargs="+", default=[], metavar="TASK=S:T",
                    help="--n-front > 0 인데 원본 jsonl 에서 에피소드를 못 찾을 때 쓸 "
-                        "형식 토큰 수 (S=step 헤더, T=터미널 문구, 예: predict=5:7)")
+                        "형식 토큰 수 (S=step 헤더 — 입력에서 빠지므로 0, T=터미널 문구, 예: predict=0:7)")
 
     a = p.parse_args()
     a.scale = [s == "true" for s in a.scale]

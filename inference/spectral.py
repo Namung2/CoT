@@ -17,17 +17,18 @@ eigh 하고 σ_k v_k = Eᵀu_k 로 바꾼다. d=5120 ≫ n 이라 훨씬 싸고,
     --all                     구간의 모든 토큰                                     tag …_all
 
     구간 t 의 토큰 0..n-1, marker = 구간 앞 형식 문구가 차지하는 토큰 수
-        step 구간: "Step N:" 헤더 / 터미널 구간: 정답 앞 문구 (extract.TERMINAL_PAT)
+        step 구간: 0 (헤더 줄은 입력에서 빠짐) / 터미널 구간: 정답 앞 문구 (extract.TERMINAL_PAT)
     front = 위치 marker .. marker+n_front-1   (형식 토큰의 e 는 버리되 누적에는 포함)
     back  = 위치 n-n_back .. n-1
     저장 위치 = front ∪ back (겹치면 한 번). 구간이 짧아 모자라면 있는 만큼만 넣는다 (짧은 구간 제외는
     읽는 쪽이 marker+n_front+n_back 로 한다). --dtype bfloat16 으로 e 의 저장 크기를 절반으로 줄일 수 있다.
 
-marker 는 n_front > 0 (그리고 --all 이 아님) 일 때만 필요하다. 원본 jsonl (traj_dir) 을 추출 때와 똑같이 토크나이즈해
-STEP_PAT 매치가 끝나는 문자 위치까지 걸친 토큰 수로 센다. 토큰 수/경계가 hidden_states 와
-다르면 그 에피소드는 버리고 사유를 센다. 원본이 없으면 fallback (TASK → (S, T)) 으로 태스크별
-고정 길이를 쓴다 (Qwen3 샘플값: decompose 4:3, plan 4:9, predict 5:7). 어느 쪽인지는
-에피소드마다 "marker_src" ("text" | "fixed" | "none") 에 남는다.
+marker 는 n_front > 0 (그리고 --all 이 아님) 일 때만 필요하다. 원본 jsonl (traj_dir) 을 추출 때와 똑같이
+(extract.prepare_output 으로 "Step N" 헤더 줄을 벗기고) 토크나이즈해 TERMINAL_PAT 매치가 끝나는 문자
+위치까지 걸친 토큰 수로 센다. 스텝 구간은 헤더가 입력에서 빠졌으므로 marker 가 항상 0 이다.
+토큰 수/경계가 hidden_states 와 다르면 그 에피소드는 버리고 사유를 센다. 원본이 없으면 fallback
+(TASK → (S, T)) 으로 태스크별 고정 길이를 쓴다 (헤더를 벗긴 뒤의 Qwen3 샘플값: decompose 0:3,
+plan 0:9, predict 0:7). 어느 쪽인지는 에피소드마다 "marker_src" ("text" | "fixed" | "none") 에 남는다.
 
 출력: <out_dir>/<task>/<level>/<status>/<tag>/chunk_XXXX.pt,  tag = make_tag(...) 예: k8_scaled_sign-data_f0_b1
     {"k", "scale", "sign_mode", "n_front", "n_back", "all", "dtype", "src", "model",
@@ -42,7 +43,7 @@ Usage:
     python inference/spectral.py                                   # 전체 task/level/status, k8 data f0_b1
     python inference/spectral.py --n-front 5 --n-back 5 -k 4 8 16 --sign-mode data max
     python inference/spectral.py --task decompose --all --dtype bfloat16
-    python inference/spectral.py --n-front 5 --fallback-marker decompose=4:3 plan=4:9 predict=5:7
+    python inference/spectral.py --n-front 5 --fallback-marker decompose=0:3 plan=0:9 predict=0:7
 """
 from __future__ import annotations
 
@@ -60,8 +61,8 @@ import torch
 from tqdm import tqdm
 
 import extract
-from extract import (MODEL, STEP_PAT, TERMINAL_PAT, load_episodes, load_chunk, gen_view,
-                     seg_labels, step_char_bounds, char_to_token_bounds)
+from extract import (MODEL, load_episodes, load_chunk, gen_view, seg_labels,
+                     prepare_output, tokenize_text)
 
 ROOT = Path(__file__).resolve().parent.parent
 TASKS = ("decompose", "plan", "predict")
@@ -385,34 +386,31 @@ def load_sources(traj_dir: Path, task: str, mode: str = "no_thinking") -> dict:
 def marker_lengths(src_ep: dict, task: str, boundaries: list[int]):
     """구간별 형식 토큰 수 [m_step1, ..., m_stepN, m_terminal]. 실패 시 (None, 사유).
 
-    extract.tok 이 세팅되어 있어야 한다 (ensure_tokenizer)."""
-    prompt = extract.render_prompt(src_ep)
-    text = src_ep["all_llm_output"]
-    enc = extract.tok(prompt + text, add_special_tokens=False, return_offsets_mapping=True)
-    offs = enc.offset_mapping
+    extract.prepare_output 이 "Step N" 헤더 줄을 입력에서 빼므로 스텝 구간의 형식 토큰은
+    0 이다. 터미널 구간만 정답 앞 문구("The LLM's action sequence is:" 등)가 남아 그 토큰 수를
+    센다. 원본을 추출 때와 똑같이 (헤더 제거 → 토크나이즈) 처리해서 토큰 수·경계가
+    hidden_states 와 일치하는지 확인하고, 다르면 버린다.
 
-    if len(enc.input_ids) != boundaries[-1]:
-        return None, "token_count_mismatch"
-    char_bounds, reason = step_char_bounds(text, task)
+    extract.tok 이 세팅되어 있어야 한다 (ensure_tokenizer)."""
+    cleaned, reason = prepare_output(src_ep["all_llm_output"], task)
     if reason is not None:
         return None, f"bounds:{reason}"
-    tb = char_to_token_bounds([0] + [len(prompt) + c for c in char_bounds], offs)
+    prompt = extract.render_prompt(src_ep)
+    enc, tb, reason = tokenize_text(prompt, cleaned.text, cleaned.bounds)
+    if reason is not None:
+        return None, f"tokenize:{reason}"
+    if len(enc.input_ids) != boundaries[-1]:
+        return None, "token_count_mismatch"
     if tb != list(boundaries):
         return None, "boundary_mismatch"
 
-    def count(s_tok, e_tok, char_end):                          # char_end 까지 걸친 토큰 수
-        m = 0
-        while s_tok + m < e_tok and offs[s_tok + m][0] < char_end:
-            m += 1
-        return m
-
-    heads = list(STEP_PAT.finditer(text))
-    term = list(TERMINAL_PAT[task].finditer(text))[-1]          # step_char_bounds 와 같은 마지막 매치
+    offs = enc.offset_mapping
+    s_tok, e_tok, char_end = boundaries[-2], boundaries[-1], len(prompt) + cleaned.term_end
+    m = 0                                                        # char_end 까지 걸친 토큰 수
+    while s_tok + m < e_tok and offs[s_tok + m][0] < char_end:
+        m += 1
     n_steps = len(boundaries) - 3
-    marks = [count(boundaries[1 + t], boundaries[2 + t], len(prompt) + heads[t].end())
-             for t in range(n_steps)]
-    marks.append(count(boundaries[-2], boundaries[-1], len(prompt) + term.end()))
-    return marks, None
+    return [0] * n_steps + [m], None
 
 
 def ensure_tokenizer():
