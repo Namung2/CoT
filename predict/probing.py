@@ -27,6 +27,7 @@ boundaries 규약 (길이 N+3):
     hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
     spectral [2] latent/spectral 저장본의 구간 마지막 e_t (e[t][-1], 구간마다 kd 벡터 하나).
                  n_back ≥ 1 이거나 --all 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
+                 옛 latent/spectral_states 포맷 (e[t] 가 (kd,) 하나, seg/pos 없음) 도 그대로 읽는다.
     edges    [3-5] 같은 저장본의 구간 안 토큰별 누적 e_i (inference/spectral.py --n-front 5 --n-back 5).
                  누적은 구간 시작에서 리셋되고 e_i 하나하나가 샘플이다. --all 로 저장한 파일은 --part both 만 된다.
                  --part both  [3] "Step N" 헤더 토큰을 뺀 앞 5개 + 마지막 5개
@@ -38,6 +39,8 @@ boundaries 규약 (길이 N+3):
     --max-step M 은 step M 까지만 probe 한다. --drop-above-max 를 같이 주면 그 뒤 step 은
     음성 샘플에서도 빠진다.
     분할은 어느 입력이든 에피소드 단위라 같은 에피소드의 샘플이 train/test 에 섞이지 않는다.
+    --n-episodes N 을 주면 로딩 뒤 에피소드 N 개만 남긴다 (success 먼저, 모자라면 failure 로 채움,
+    --sample-seed 로 고정). 남긴 에피소드 목록은 <output>/episodes.json 에 쓴다.
 
 Usage:
     python probing.py --pt 'latent/hidden_states/plan/*/*/chunk_*.pt' --output out/plan_all
@@ -98,7 +101,7 @@ def load_pt(patterns, offset, with_prompt=False):
 
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "hidden", seed)
-            E = ep["E"].float().numpy()
+            E = ep["E"]                                   # bf16 torch 그대로 (GPU 경로가 그대로 올린다)
             b = [int(x) for x in ep["boundaries"]]
             n_tok = E.shape[0]
 
@@ -116,7 +119,7 @@ def load_pt(patterns, offset, with_prompt=False):
                 if i < start:
                     stats["segment_too_short"] += 1
                     return
-                Xs.append(E[i].copy()); Ns.append(label); Gs.append(gid)   # view 면 E 전체가 살아남아 300GB 까지 감
+                Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid)  # view 면 E 전체가 살아남아 300GB 까지 감
 
             if with_prompt:
                 take(b[0], b[1], PROMPT_LABEL)
@@ -155,14 +158,18 @@ def load_spectral(patterns, k=None, sign_mode=None):
             continue
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "spectral", seed)
-            seg, n_seg = ep["seg"], len(ep["e"])
+            seg, n_seg = ep.get("seg"), len(ep["e"])
             stats["episodes"] += 1
             for t in sorted(ep["e"]):
+                row = ep["e"][t]
+                if row.dim() == 1:                                    # 옛 spectral_states: 구간마다 e_t 하나
+                    Xs.append(row.clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                    continue
                 ps = ep["pos"][t]
                 if not ps or ps[-1] != seg[t + 1] - seg[t] - 1:      # 마지막 토큰이 저장돼 있어야 e_t
                     stats["no_last_token"] += 1
                     continue
-                Xs.append(ep["e"][t][-1].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                Xs.append(row[-1].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
@@ -203,20 +210,28 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
                         continue
                     if part == "back" and pos < n - n_back:
                         continue
-                    Xs.append(row.float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                    Xs.append(row.clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
 def _pack(Xs, Ns, Gs, stats):
+    """행 목록 → data. X 는 torch 텐서로, 저장 dtype 그대로 둔다 (bf16 저장본이면 bf16 — fp32 로 바꾸면
+    edges 는 수십 GB 가 두 배가 된다). CPU(sklearn) 경로는 main 에서 한 번 float32 numpy 로 바꾼다."""
     if not Xs:
         raise SystemExit("벡터 없음 — 입력 경로/규약 확인")
-    data = dict(X=np.stack(Xs).astype(np.float32),
-                step_num=np.array(Ns, np.int32),
-                group=np.array(Gs, dtype=object))
+    X = torch.stack(Xs)
+    Xs.clear()
+    data = dict(X=X, step_num=np.array(Ns, np.int32), group=np.array(Gs, dtype=object))
     print(f"loaded: {dict(stats)}")
-    print(f"  X={data['X'].shape}  구간별 개수={dict(sorted(Counter(Ns).items()))}  "
-          f"groups={len(set(Gs))}")
+    print(f"  X={tuple(X.shape)} {str(X.dtype).removeprefix('torch.')}  "
+          f"구간별 개수={dict(sorted(Counter(Ns).items()))}  groups={len(set(Gs))}")
     return data
+
+
+def _take(data, idx):
+    """행 인덱스로 data 를 줄인다 (X 는 torch, 나머지는 numpy)."""
+    idx = np.asarray(idx)
+    return {k: (v[torch.as_tensor(idx)] if torch.is_tensor(v) else v[idx]) for k, v in data.items()}
 
 
 # ---------------------------------------------------------------- 데이터셋 / 모델
@@ -229,35 +244,146 @@ def target_name(label: int) -> str:
     return f"step_{label}"
 
 
+def subsample_episodes(data, n, seed):
+    """에피소드(group) 단위로 n 개만 남긴다. success 를 먼저 채우고 모자라면 failure 로.
+
+    group id 는 "<task>/<level>/<status>/<seed>" 라 status 를 여기서 읽는다. success 가 n 보다
+    많으면 그 안에서 n 개를 무작위로 고른다. 반환: (줄인 data, 남긴 group 목록 정렬)."""
+    groups = np.unique(data["group"])
+    status = np.array([g.split("/")[2] for g in groups])
+    rng = np.random.default_rng(seed)
+    succ = rng.permutation(groups[status == "success"])
+    fail = rng.permutation(groups[status != "success"])
+    keep = np.concatenate([succ[:n], fail[:max(0, n - len(succ))]])
+    mask = np.isin(data["group"], keep)
+    print(f"--n-episodes {n}: success {min(n, len(succ))}/{len(succ)} + failure "
+          f"{max(0, n - len(succ))}/{len(fail)} → {len(keep)} episodes, X={int(mask.sum())} rows")
+    if not mask.all():
+        data = _take(data, np.flatnonzero(mask))
+    return data, sorted(keep.tolist())
+
+
 def make_binary(data, label):
-    """one-vs-rest: 해당 구간이 positive, 나머지 구간 전부가 negative."""
-    m = data["step_num"] == label
-    X = np.vstack([data["X"][m], data["X"][~m]])
-    y = np.r_[np.ones(m.sum()), np.zeros((~m).sum())].astype(int)
-    g = np.concatenate([data["group"][m], data["group"][~m]])
-    return X, y, g
+    """one-vs-rest 라벨: 해당 구간이 1, 나머지 구간 전부 0. X 는 복사하지 않는다 (edges 는 수십 GB)."""
+    y = (data["step_num"] == label).astype(int)
+    return data["X"], y, data["group"]
 
 
-def split(X, y, g, test_size, seed, group):
+def split(n, y, g, test_size, seed, group):
+    """행 인덱스 (train, test). group=True 면 에피소드 단위."""
+    dummy = np.empty((n, 0))
     if group:
-        return next(GroupShuffleSplit(1, test_size=test_size,
-                                      random_state=seed).split(X, y, g))
-    return train_test_split(np.arange(len(y)), test_size=test_size,
-                            random_state=seed, stratify=y)
+        return next(GroupShuffleSplit(1, test_size=test_size, random_state=seed).split(dummy, y, g))
+    return train_test_split(np.arange(n), test_size=test_size, random_state=seed, stratify=y)
 
 
-def fit(Xtr, ytr, seed, cv, scale):
+class GpuData:
+    """X 전체를 GPU 에 한 번만 올려 두고 (저장 dtype 그대로 — bf16 이면 fp32 의 절반), fit / predict 가
+    행 인덱스를 청크씩 꺼내 fp32 로 바꿔 쓴다. 70만 x 40960 bf16 ≈ 57GB 가 GPU 에 상주한다."""
+
+    def __init__(self, X: torch.Tensor, device, chunk: int = 32768):
+        self.device = torch.device(device)
+        self.X = X.to(self.device)
+        self.chunk = chunk
+
+    def batches(self, idx):
+        """idx 순서대로 (m x D) fp32 청크를 낸다."""
+        idx_t = torch.as_tensor(np.asarray(idx), device=self.device)
+        for i in range(0, len(idx_t), self.chunk):
+            yield self.X[idx_t[i:i + self.chunk]].float()
+
+
+class TorchLogReg:
+    """GPU 로지스틱 회귀. sklearn LogisticRegression(C, L2, class_weight="balanced") 과 같은 목적함수
+
+        C · Σ_i w_i · logloss_i(β)  +  ½‖β_w‖²      (w_i = n / (2·n_class(i)), 절편은 벌점 없음)
+
+    를 torch L-BFGS(strong Wolfe) 로 푼다. 손실과 기울기는 GpuData 청크를 돌며 해석적으로 누적하므로
+    autograd 그래프도, X 의 fp32 복사본도 만들지 않는다. scale=True 면 StandardScaler 와 같은 표준화
+    (학습 행 기준 평균/표준편차, 2-pass) 를 내장한다. 학습 뒤 파라미터는 CPU 에 둬서 pickle 가능."""
+
+    def __init__(self, C=1.0, scale=True, max_iter=500, tol=1e-5):
+        self.C, self.scale, self.max_iter, self.tol = C, scale, max_iter, tol
+
+    def fit(self, gd: GpuData, idx, y):
+        dev, d = gd.device, gd.X.shape[1]
+        n, n_pos = len(idx), float(np.sum(y))
+        y_t = torch.as_tensor(np.asarray(y), dtype=torch.float32, device=dev)
+        w_t = torch.where(y_t > 0.5, torch.tensor(n / (2 * n_pos), device=dev),
+                          torch.tensor(n / (2 * (n - n_pos)), device=dev))        # balanced
+
+        if self.scale:                                                           # 2-pass 평균/표준편차
+            mean = torch.zeros(d, device=dev)
+            for xb in gd.batches(idx):
+                mean += xb.sum(0)
+            mean /= n
+            var = torch.zeros(d, device=dev)
+            for xb in gd.batches(idx):
+                xb -= mean
+                var += (xb * xb).sum(0)
+            std = (var / n).sqrt()
+            std = torch.where(std > 0, std, torch.ones_like(std))
+        else:
+            mean, std = torch.zeros(d, device=dev), torch.ones(d, device=dev)
+
+        beta = torch.zeros(d + 1, device=dev, requires_grad=True)
+        bce = torch.nn.functional.binary_cross_entropy_with_logits
+
+        def closure():
+            with torch.no_grad():
+                wv, b = beta[:-1], beta[-1]
+                loss = torch.zeros((), device=dev)
+                grad = torch.zeros(d + 1, device=dev)
+                off = 0
+                for xb in gd.batches(idx):
+                    m = xb.shape[0]
+                    yb, wb = y_t[off:off + m], w_t[off:off + m]
+                    off += m
+                    xb = (xb - mean) / std
+                    z = xb @ wv + b
+                    loss += self.C * (wb * bce(z, yb, reduction="none")).sum()
+                    r = self.C * wb * (torch.sigmoid(z) - yb)
+                    grad[:-1] += xb.T @ r
+                    grad[-1] += r.sum()
+                loss += 0.5 * (wv * wv).sum()
+                grad[:-1] += wv
+            beta.grad = grad
+            return loss
+
+        opt = torch.optim.LBFGS([beta], lr=1.0, max_iter=self.max_iter, history_size=20,
+                                tolerance_grad=self.tol, tolerance_change=1e-9,
+                                line_search_fn="strong_wolfe")
+        opt.step(closure)
+        self.n_iter_ = opt.state[opt._params[0]].get("n_iter", -1)
+        self.mean_, self.std_, self.beta_ = mean.cpu(), std.cpu(), beta.detach().cpu()
+        return self
+
+    @torch.no_grad()
+    def predict_proba(self, gd: GpuData, idx):
+        dev = gd.device
+        mean, std, beta = self.mean_.to(dev), self.std_.to(dev), self.beta_.to(dev)
+        out = [torch.sigmoid(((xb - mean) / std) @ beta[:-1] + beta[-1]).cpu() for xb in gd.batches(idx)]
+        p = torch.cat(out).double().numpy()
+        return np.stack([1 - p, p], 1)
+
+
+def fit(Xnp, gd, y, idx, seed, cv, scale):
+    """Xnp: CPU 경로용 float32 numpy (GPU 경로면 None). gd: GpuData (CPU 경로면 None)."""
+    if gd is not None:
+        if cv:
+            raise SystemExit("--cv 는 --device cpu 에서만 된다")
+        return TorchLogReg(C=1.0, scale=scale).fit(gd, idx, y[idx])
     if cv:
         lr = LogisticRegressionCV(Cs=np.logspace(-4, 2, 7), cv=5, scoring="roc_auc",
                                   class_weight="balanced", max_iter=2000,
                                   random_state=seed, n_jobs=-1)
     else:
         lr = LogisticRegression(class_weight="balanced", max_iter=2000, random_state=seed)
-    return (make_pipeline(StandardScaler(), lr) if scale else make_pipeline(lr)).fit(Xtr, ytr)
+    return (make_pipeline(StandardScaler(), lr) if scale else make_pipeline(lr)).fit(Xnp[idx], y[idx])
 
 
-def evaluate(clf, X, y):
-    p = clf.predict_proba(X)[:, 1]
+def evaluate(clf, Xnp, gd, idx, y):
+    p = clf.predict_proba(gd, idx)[:, 1] if gd is not None else clf.predict_proba(Xnp[idx])[:, 1]
     yhat = (p > 0.5).astype(int)
     return dict(acc=accuracy_score(y, yhat), f1=f1_score(y, yhat, zero_division=0),
                 auc=roc_auc_score(y, p))
@@ -288,12 +414,17 @@ def main():
                     help="이 번호를 넘는 step 은 probe 대상에서 제외 (기본: negative 로는 남음)")
     ap.add_argument("--drop-above-max", action="store_true",
                     help="--max-step 을 넘는 step 샘플을 데이터에서 아예 뺀다 (negative 로도 안 씀)")
+    ap.add_argument("--n-episodes", type=int, default=None,
+                    help="로딩 뒤 에피소드 이 개수만 사용 (success 우선, 모자라면 failure 로 채움)")
+    ap.add_argument("--sample-seed", type=int, default=0, help="--n-episodes 추출 시드")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456, 789, 1011])
     ap.add_argument("--test-size", type=float, default=0.2)
     ap.add_argument("--no-group-split", action="store_true",
                     help="에피소드 단위 분할을 끈다 (같은 에피소드가 train/test 로 쪼개짐)")
     ap.add_argument("--no-scale", action="store_true")
     ap.add_argument("--cv", action="store_true")
+    ap.add_argument("--device", default="cpu",
+                    help="cpu: sklearn LogisticRegression | cuda[:i]: 같은 목적함수를 torch L-BFGS 로 (TorchLogReg)")
     a = ap.parse_args()
 
     a.output.mkdir(parents=True, exist_ok=True)
@@ -305,10 +436,14 @@ def main():
         data = load_spectral(a.pt, a.k, a.sign_mode)
     else:
         data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
+    if a.n_episodes is not None:
+        data, kept = subsample_episodes(data, a.n_episodes, a.sample_seed)
+        with open(a.output / "episodes.json", "w") as f:
+            json.dump({"n_episodes": a.n_episodes, "sample_seed": a.sample_seed, "groups": kept}, f)
     if a.max_step is not None and a.drop_above_max:
         keep = data["step_num"] <= a.max_step          # answer(-1)·prompt(0) 는 남는다
         print(f"--drop-above-max: step>{a.max_step} 샘플 {int((~keep).sum())}개 제거")
-        data = {k_: v[keep] for k_, v in data.items()}
+        data = _take(data, np.flatnonzero(keep))
     group, scale = not a.no_group_split, not a.no_scale
     if group and len(np.unique(data["group"])) < 2:
         print("[warn] 그룹이 1개뿐 → 행 단위 split 으로 대체")
@@ -323,7 +458,14 @@ def main():
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
     print(f"targets={[target_name(l) for l in labels]} "
-          f"source={a.source} part={a.part} group={group} scale={scale} cv={a.cv} offset={a.offset}")
+          f"source={a.source} part={a.part} group={group} scale={scale} cv={a.cv} offset={a.offset} device={a.device}")
+
+    if a.device == "cpu":
+        Xnp, gd = data["X"].float().numpy(), None            # float32 저장본이면 복사 없음
+    else:
+        Xnp, gd = None, GpuData(data["X"], a.device)
+        print(f"X on {a.device}: {tuple(gd.X.shape)} {str(gd.X.dtype).removeprefix('torch.')} "
+              f"({gd.X.numel() * gd.X.element_size() / 2**30:.1f} GiB)")
 
     rows = []
     for label in labels:
@@ -333,13 +475,13 @@ def main():
             print(f"[skip] {t}: 샘플 부족")
             continue
         for s in a.seeds:
-            tr, te = split(X, y, g, a.test_size, s, group)
+            tr, te = split(len(y), y, g, a.test_size, s, group)
             if len(np.unique(y[te])) < 2:
                 print(f"[skip] {t} seed={s}: test 에 한 클래스만")
                 continue
-            clf = fit(X[tr], y[tr], s, a.cv, scale)
-            m_tr, m_te = evaluate(clf, X[tr], y[tr]), evaluate(clf, X[te], y[te])
-            lr = clf[-1]
+            clf = fit(Xnp, gd, y, tr, s, a.cv, scale)
+            m_tr, m_te = evaluate(clf, Xnp, gd, tr, y[tr]), evaluate(clf, Xnp, gd, te, y[te])
+            lr = clf if isinstance(clf, TorchLogReg) else clf[-1]
             rows.append(dict(target=t, seed=s, n_train=int(len(tr)), n_test=int(len(te)),
                              n_pos_test=int(y[te].sum()),
                              C=float(np.atleast_1d(getattr(lr, "C_", lr.C))[0]),

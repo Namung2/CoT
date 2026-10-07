@@ -23,14 +23,14 @@ if [[ "${INFERENCE_SH_BG:-}" != "1" ]]; then
     exit 0
 fi
 
-export CUDA_VISIBLE_DEVICES=0                      # Qwen3-32B라 GPU 여러 개 필요하면 수정
+export CUDA_VISIBLE_DEVICES=2                     # Qwen3-32B라 GPU 여러 개 필요하면 수정
 
 # task:level — 실제 data/*_no_thinking.jsonl의 env_name 그대로
 TASK_LEVELS=(
-    "decompose:BabyAI-GoToObj-v0"
-    "decompose:BabyAI-GoTo-v0"
-    "decompose:BabyAI-Synth-v0"
-    "decompose:BabyAI-BossLevel-v0"
+    # "decompose:BabyAI-GoToObj-v0"
+    # "decompose:BabyAI-GoTo-v0"
+    # "decompose:BabyAI-Synth-v0"
+    # "decompose:BabyAI-BossLevel-v0"
     "plan:CustomBabyAI-GoToRedBall-Small-4Dists-v0"
     "plan:CustomBabyAI-GoToRedBall-Medium-40Dists-v0"
     "plan:CustomBabyAI-GoToRedBall-Large-100Dists-v0"
@@ -63,10 +63,8 @@ for tl in "${TASK_LEVELS[@]}"; do
     level="${tl#*:}"
 
     run_stage "${task}_${level}_success" \
-        python inference/main.py --task "$task" --level "$level" --status success
+        python inference/main.py --task "$task" --level "$level" --status success --no-spectral
 
-    run_stage "${task}_${level}_failure" \
-        python inference/main.py --task "$task" --level "$level" --status failure --no-extract
 done
 
 echo ""

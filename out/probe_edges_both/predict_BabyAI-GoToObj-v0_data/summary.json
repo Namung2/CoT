@@ -1,0 +1,77 @@
+{
+  "step_1": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_2": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.99998590159312,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9999750006249843,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_3": {
+    "test_auc": {
+      "mean": 0.9999999812669497,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9998872127449598,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9997985799889219,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "step_4": {
+    "test_auc": {
+      "mean": 0.9999999893972841,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 0.9999718031862399,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 0.9999092476631273,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  },
+  "answer": {
+    "test_auc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_acc": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "test_f1": {
+      "mean": 1.0,
+      "std": 0.0
+    },
+    "n_seeds": 1
+  }
+}
