@@ -36,6 +36,10 @@ boundaries 규약 (길이 N+3):
                  터미널 구간은 정답 앞 형식 문구("<START>" 등)를 헤더처럼 뺀다.
                  형식 문구 + 앞 5 + 뒤 5 보다 짧은 구간은 3/4/5 모두에서 뺀다 (--keep-short 로 끔).
                  --k / --sign-mode 로 spectral 설정을 고른다.
+    pct      [6] 같은 저장본 중 --pct 로 저장한 파일 (inference/spectral.py --pct 10 20 … 100) 에서
+                 구간 길이의 Q% 지점까지 누적한 e 하나 (--pct Q 로 지점을 고른다, 구간마다 샘플 하나).
+                 위치는 spectral.pct_position 으로 되찾는다. 100 은 [2] 의 e_t 와 같다.
+                 t < k 인 지점(짧은 구간의 작은 Q) 도 거르지 않고 넣는다; 개수만 stats 의 t_lt_k 로 센다.
     --max-step M 은 step M 까지만 probe 한다. --drop-above-max 를 같이 주면 그 뒤 step 은
     음성 샘플에서도 빠진다.
     분할은 어느 입력이든 에피소드 단위라 같은 에피소드의 샘플이 train/test 에 섞이지 않는다.
@@ -50,7 +54,10 @@ Usage:
         --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_f5_b5/chunk_*.pt' --output out/edge_front
     python probing.py --pt 'latent/hidden_states/plan/BabyAI-GoTo-v0/*/chunk_*.pt' \
         --output out/plan_goto --offset 1 --cv
+    python probing.py --source pct --pct 40 \
+        --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_p10-20-40-60-80-90-100/chunk_*.pt' --output out/pct_40
 """
+import sys
 import json
 import glob
 import pickle
@@ -67,13 +74,17 @@ from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "inference"))
+from spectral import pct_position  # noqa: E402  (저장 때와 같은 q% → 위치 규칙)
+
 PROMPT_LABEL = 0          # step_num 0 = 프롬프트 끝
 ANSWER_LABEL = -1         # step_num -1 = 터미널(정답 문장)
 
 
 # ---------------------------------------------------------------- .pt 로딩
 
-SOURCES = ("hidden", "spectral", "edges")
+SOURCES = ("hidden", "spectral", "edges", "pct")
 
 
 def _paths(patterns):
@@ -211,6 +222,38 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
                     if part == "back" and pos < n - n_back:
                         continue
                     Xs.append(row.clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+    return _pack(Xs, Ns, Gs, stats)
+
+
+def load_pct(patterns, pct, k=None, sign_mode=None):
+    """[6] pct: 구간 길이의 pct% 지점까지 누적한 e (구간마다 하나). --pct 로 저장한 파일만 읽는다.
+
+    저장본은 pos 와 e 만 갖고 있으므로 pct_position(pct, n) 으로 위치를 되찾아 그 행을 꺼낸다.
+    짧은 구간에서 여러 % 가 같은 위치로 합쳐져도 위치는 반드시 있다. 거르지 않는다 —
+    t < k 인 지점(그람 rank 부족) 개수만 t_lt_k 로 센다."""
+    Xs, Ns, Gs = [], [], []
+    stats, seen = Counter(), set()
+    for p in _paths(patterns):
+        d = torch.load(p, map_location="cpu", weights_only=False)
+        if not _config_ok(d, p, k, sign_mode, seen, stats):
+            continue
+        if pct not in d.get("pct", []):
+            raise SystemExit(f"{p}: {pct}% 지점이 저장돼 있지 않다 (저장된 pct={d.get('pct')})")
+        k_eig = d["k"]
+        for seed, ep in d["episodes"].items():
+            gid = _gid(p, "edges", seed)                      # spectral/edges 와 같은 경로 규칙
+            seg, n_seg = ep["seg"], len(ep["e"])
+            stats["episodes"] += 1
+            for t in range(n_seg):
+                n = seg[t + 1] - seg[t]
+                want = pct_position(pct, n)
+                ps = ep["pos"][t]
+                if want not in ps:
+                    stats["pos_missing"] += 1
+                    continue
+                if want + 1 < k_eig:
+                    stats["t_lt_k"] += 1
+                Xs.append(ep["e"][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
@@ -396,7 +439,9 @@ def main():
     ap.add_argument("--pt", nargs="+", required=True, help="chunk_*.pt glob (여러 개 가능)")
     ap.add_argument("--source", choices=SOURCES, default="hidden",
                     help="hidden: 구간 마지막 토큰 hidden (1) | spectral: 구간 전체 누적 e_t (2) | "
-                         "edges: 구간 앞/뒤 토큰별 누적 e_i (3-5, --part)")
+                         "edges: 구간 앞/뒤 토큰별 누적 e_i (3-5, --part) | pct: 구간 Q%% 지점 누적 e (6, --pct)")
+    ap.add_argument("--pct", type=int, default=None, metavar="Q",
+                    help="--source pct 일 때: 구간 길이의 Q%% 지점 (저장본의 --pct 목록 중 하나, 100 = 구간 끝)")
     ap.add_argument("--part", choices=("both", "front", "back"), default="both",
                     help="--source edges 일 때: both=앞5+뒤5 (3), front=헤더 뺀 앞5 (4), back=뒤5 (5)")
     ap.add_argument("--k", type=int, default=None,
@@ -434,6 +479,10 @@ def main():
         data = load_pt(a.pt, a.offset, a.with_prompt)
     elif a.source == "spectral":
         data = load_spectral(a.pt, a.k, a.sign_mode)
+    elif a.source == "pct":
+        if a.pct is None:
+            raise SystemExit("--source pct 는 --pct Q 가 필요하다")
+        data = load_pct(a.pt, a.pct, a.k, a.sign_mode)
     else:
         data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
     if a.n_episodes is not None:
@@ -458,7 +507,8 @@ def main():
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
     print(f"targets={[target_name(l) for l in labels]} "
-          f"source={a.source} part={a.part} group={group} scale={scale} cv={a.cv} offset={a.offset} device={a.device}")
+          f"source={a.source} part={a.part} pct={a.pct} group={group} scale={scale} cv={a.cv} "
+          f"offset={a.offset} device={a.device}")
 
     if a.device == "cpu":
         Xnp, gd = data["X"].float().numpy(), None            # float32 저장본이면 복사 없음
@@ -528,7 +578,7 @@ def main():
     ax.set_ylim(0, 1.05)
     ax.legend()
     src = {"hidden": f"hidden offset={a.offset}", "spectral": "spectral e_t",
-           "edges": f"spectral edges ({a.part})"}[a.source]
+           "edges": f"spectral edges ({a.part})", "pct": f"spectral {a.pct}% cumulative"}[a.source]
     ax.set_title(f"Last-layer probes: {src} (seeds={len(a.seeds)}, group={group})")
     fig.tight_layout()
     fig.savefig(a.output / "summary.png", dpi=150)

@@ -15,6 +15,9 @@ eigh 하고 σ_k v_k = Eᵀu_k 로 바꾼다. d=5120 ≫ n 이라 훨씬 싸고,
     --n-front 0 --n-back 1    구간마다 마지막 e_t 하나 (구간 전체 SVD 와 같은 값)    tag …_f0_b1  ← 기본
     --n-front 5 --n-back 5    형식 문구 뒤 5개 + 마지막 5개 (probing 의 edges 입력)  tag …_f5_b5
     --all                     구간의 모든 토큰                                     tag …_all
+    --pct 10 20 40 … 100      구간 길이의 q% 까지 누적한 지점 (t = ⌈q·n/100⌉, 위치 t-1)  tag …_p10-20-40-…
+                              짧은 구간에서 겹치는 지점은 하나로 합쳐지고, 100 은 구간 마지막 e_t 와 같다.
+                              t < k 인 지점은 그람 rank 가 t 라 뒤쪽 고유성분이 0 이다 (그대로 저장, pos 로 구분).
 
     구간 t 의 토큰 0..n-1, marker = 구간 앞 형식 문구가 차지하는 토큰 수
         step 구간: 0 (헤더 줄은 입력에서 빠짐) / 터미널 구간: 정답 앞 문구 (extract.TERMINAL_PAT)
@@ -24,14 +27,14 @@ eigh 하고 σ_k v_k = Eᵀu_k 로 바꾼다. d=5120 ≫ n 이라 훨씬 싸고,
     읽는 쪽이 marker+n_front+n_back 로 한다). --dtype bfloat16 으로 e 의 저장 크기를 절반으로 줄일 수 있다.
 
 marker 는 n_front > 0 (그리고 --all 이 아님) 일 때만 필요하다. 원본 jsonl (traj_dir) 을 추출 때와 똑같이
-(extract.prepare_output 으로 "Step N" 헤더 줄을 벗기고) 토크나이즈해 TERMINAL_PAT 매치가 끝나는 문자
+(extract.prepare_output 으로 "Step N" 마커를 벗기고) 토크나이즈해 TERMINAL_PAT 매치가 끝나는 문자
 위치까지 걸친 토큰 수로 센다. 스텝 구간은 헤더가 입력에서 빠졌으므로 marker 가 항상 0 이다.
 토큰 수/경계가 hidden_states 와 다르면 그 에피소드는 버리고 사유를 센다. 원본이 없으면 fallback
 (TASK → (S, T)) 으로 태스크별 고정 길이를 쓴다 (헤더를 벗긴 뒤의 Qwen3 샘플값: decompose 0:3,
 plan 0:9, predict 0:7). 어느 쪽인지는 에피소드마다 "marker_src" ("text" | "fixed" | "none") 에 남는다.
 
 출력: <out_dir>/<task>/<level>/<status>/<tag>/chunk_XXXX.pt,  tag = make_tag(...) 예: k8_scaled_sign-data_f0_b1
-    {"k", "scale", "sign_mode", "n_front", "n_back", "all", "dtype", "src", "model",
+    {"k", "scale", "sign_mode", "n_front", "n_back", "all", "pct", "dtype", "src", "model",
      "episodes": {seed: {"seg": [...], "labels": [...], "marker": [m_0..m_N], "marker_src": str,
                          "pos": {t: [p_1 < … < p_m]}, "e": {t: (m, kd)}, "lam": {t: (m, k)}}}}
     t 는 extract.gen_view 구간 번호 (0..N-1 = Step 1..N, N = 터미널, 프롬프트 제외). pos 는 구간 안
@@ -76,43 +79,70 @@ EPS = 1e-12
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 
 
+def pct_position(q: int, n: int) -> int:
+    """구간 길이 n 의 q% 지점 (0-based 위치). 누적 토큰 수 t = ⌈q·n/100⌉ 이고 위치는 t-1.
+    q=100 → n-1 (구간 마지막), 작은 q 는 최소 0. probing.py 가 같은 함수로 위치를 되찾는다."""
+    t = -(-q * n // 100)
+    return min(max(t, 1), n) - 1
+
+
 @dataclass(frozen=True)
 class Select:
     """구간 안에서 어느 위치의 e 를 저장할지.
 
-    all=True 면 모든 토큰. 아니면 front (marker 뒤 n_front 개) ∪ back (뒤 n_back 개).
-    문자열 형식은 tag 와 같다: "all" | "f<n_front>_b<n_back>" (Select.parse / str())."""
+    all=True 면 모든 토큰. pct 가 있으면 구간 길이의 q% 지점들 (pct_position). 아니면
+    front (marker 뒤 n_front 개) ∪ back (뒤 n_back 개).
+    문자열 형식은 tag 와 같다: "all" | "p<q>-<q>-…" | "f<n_front>_b<n_back>" (Select.parse / str())."""
     n_front: int = 0
     n_back: int = 1
     all: bool = False
+    pct: tuple[int, ...] = ()
 
     def __post_init__(self):
         if self.all:
+            if (self.n_front, self.n_back, self.pct) != (0, 0, ()):
+                raise ValueError("all=True 면 n_front / n_back 은 0, pct 는 비어 있어야 한다")
+        elif self.pct:
             if (self.n_front, self.n_back) != (0, 0):
-                raise ValueError("all=True 면 n_front / n_back 은 0 이어야 한다")
+                raise ValueError("pct 를 주면 n_front / n_back 은 0 이어야 한다")
+            if any(not (0 < q <= 100) for q in self.pct) or list(self.pct) != sorted(set(self.pct)):
+                raise ValueError(f"pct 는 0 < q ≤ 100 의 오름차순 중복 없는 정수 (got {self.pct})")
         elif self.n_front < 0 or self.n_back < 0 or self.n_front + self.n_back == 0:
             raise ValueError(f"need n_front, n_back ≥ 0 and not both 0 (got {self.n_front}, {self.n_back})")
+
+    @classmethod
+    def from_pct(cls, pct) -> "Select":
+        return cls(0, 0, False, tuple(sorted(set(int(q) for q in pct))))
 
     @classmethod
     def parse(cls, text: str) -> "Select":
         if text == "all":
             return cls(0, 0, True)
+        m = re.fullmatch(r"p(\d+(?:-\d+)*)", text)
+        if m:
+            return cls.from_pct(m.group(1).split("-"))
         m = re.fullmatch(r"f(\d+)_b(\d+)", text)
         if not m:
-            raise ValueError(f"select 는 'all' 또는 'f<n>_b<n>' (got {text!r})")
+            raise ValueError(f"select 는 'all' | 'p<q>-<q>-…' | 'f<n>_b<n>' (got {text!r})")
         return cls(int(m.group(1)), int(m.group(2)))
 
     def __str__(self) -> str:
-        return "all" if self.all else f"f{self.n_front}_b{self.n_back}"
+        if self.all:
+            return "all"
+        if self.pct:
+            return "p" + "-".join(str(q) for q in self.pct)
+        return f"f{self.n_front}_b{self.n_back}"
 
     @property
     def needs_marker(self) -> bool:
-        return not self.all and self.n_front > 0
+        return not self.all and not self.pct and self.n_front > 0
 
     def positions(self, n: int, marker: int) -> list[int]:
         """구간 길이 n 에서 저장할 위치 (오름차순, 중복 없음). 짧으면 있는 만큼만."""
         if self.all:
             return list(range(n))
+        if self.pct:
+            return sorted({pct_position(q, n) for q in self.pct}) if n > 0 else []
         front = range(min(marker, n), min(marker + self.n_front, n))
         back = range(max(n - self.n_back, 0), n)
         return sorted(set(front) | set(back))
@@ -386,9 +416,9 @@ def load_sources(traj_dir: Path, task: str, mode: str = "no_thinking") -> dict:
 def marker_lengths(src_ep: dict, task: str, boundaries: list[int]):
     """구간별 형식 토큰 수 [m_step1, ..., m_stepN, m_terminal]. 실패 시 (None, 사유).
 
-    extract.prepare_output 이 "Step N" 헤더 줄을 입력에서 빼므로 스텝 구간의 형식 토큰은
-    0 이다. 터미널 구간만 정답 앞 문구("The LLM's action sequence is:" 등)가 남아 그 토큰 수를
-    센다. 원본을 추출 때와 똑같이 (헤더 제거 → 토크나이즈) 처리해서 토큰 수·경계가
+    extract.prepare_output 이 "Step N" 마커를 입력에서 빼므로 스텝 구간의 형식 토큰은
+    0 이다 (헤더 줄의 제목은 본문으로 친다). 터미널 구간만 정답 앞 문구("The LLM's action sequence is:" 등)가 남아 그 토큰 수를
+    센다. 원본을 추출 때와 똑같이 (마커 제거 → 토크나이즈) 처리해서 토큰 수·경계가
     hidden_states 와 일치하는지 확인하고, 다르면 버린다.
 
     extract.tok 이 세팅되어 있어야 한다 (ensure_tokenizer)."""
@@ -528,6 +558,7 @@ def process_chunk(cf: Path, task: str, level: str, status: str, out_root: Path,
         out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"k": k, "scale": scale, "sign_mode": sm,
                     "n_front": select.n_front, "n_back": select.n_back, "all": select.all,
+                    "pct": list(select.pct),
                     "dtype": str(dtype).removeprefix("torch."),
                     "src": str(cf), "model": d.get("model", MODEL), "episodes": eps}, out)
         stats["files"] += 1
@@ -580,6 +611,8 @@ def main():
     ap.add_argument("--n-front", type=int, default=0, help="구간 앞(형식 문구 뒤)에서 저장할 토큰 수")
     ap.add_argument("--n-back", type=int, default=1, help="구간 뒤에서 저장할 토큰 수 (1 = 마지막 e_t 만)")
     ap.add_argument("--all", action="store_true", help="구간의 모든 토큰을 저장 (--n-front/--n-back 무시)")
+    ap.add_argument("--pct", type=int, nargs="+", default=None, metavar="Q",
+                    help="구간 길이의 Q%% 지점들만 저장 (예: 10 20 40 60 80 90 100; --n-front/--n-back 무시)")
     ap.add_argument("--dtype", default="float32", choices=list(DTYPES), help="e 저장 dtype (lam 은 float32)")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     ap.add_argument("--traj-dir", type=Path, default=ROOT / "generation" / "trajectory",
@@ -595,7 +628,7 @@ def main():
     a = ap.parse_args()
 
     configs = [(k, s == "true", sm) for k in a.k for s in a.scale for sm in a.sign_mode]
-    select = ALL if a.all else Select(a.n_front, a.n_back)
+    select = ALL if a.all else Select.from_pct(a.pct) if a.pct else Select(a.n_front, a.n_back)
     fallback = parse_fallback(a.fallback_marker)
     total = Counter()
     t0 = time.time()

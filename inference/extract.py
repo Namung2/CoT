@@ -119,7 +119,7 @@ def step_char_bounds(text: str, task: str) -> tuple[list[int] | None, str | None
     (cot_*.py 의 프롬프트가 6단계 지시문) 이어붙인 전체 텍스트에 걸면 프롬프트
     쪽 헤더가 먼저 잡힌다.
 
-    추출(forward pass)에는 이 함수가 아니라 헤더 줄을 벗긴 prepare_output 을 쓴다.
+    추출(forward pass)에는 이 함수가 아니라 "Step N" 마커를 벗긴 prepare_output 을 쓴다.
     이 함수는 원문을 그대로 보는 통계·점검용이다 (script/header_stats.py).
     """
     heads, term, _, starts, reason = _segment(text, task)
@@ -133,9 +133,9 @@ def step_char_bounds(text: str, task: str) -> tuple[list[int] | None, str | None
 
 @dataclass
 class Cleaned:
-    """헤더 줄을 벗긴 출력과 그 좌표계의 경계.
+    """"Step N" 마커를 벗긴 출력과 그 좌표계의 경계.
 
-    text     : "Step N. ..." 헤더 줄이 빠진 출력. 모델에는 이것이 들어간다.
+    text     : "### Step N." 류 마커만 빠진 출력 (헤더 줄의 제목·본문은 남는다). 모델에는 이것이 들어간다.
     bounds   : text 기준 [0, step2 시작, ..., stepN 시작, 터미널 시작, len(text)]
     term_end : text 기준 터미널 마커 매치 끝 (spectral.py 가 터미널 형식 토큰 수를 셀 때)
     n_header_chars : 벗겨낸 문자 수 (meta 기록용)
@@ -146,43 +146,47 @@ class Cleaned:
     n_header_chars: int
 
 
+_AFTER_MARK = re.compile(r"[*_]*[ \t]*")    # 마커 뒤에 남는 볼드 닫힘("**Step 3:**" 의 **) 과 가로 공백
+
+
 def prepare_output(text: str, task: str) -> tuple[Cleaned | None, str | None]:
-    """출력에서 "Step N" 헤더 **줄 전체**를 지우고, 지운 좌표계로 경계를 만든다.
+    """출력에서 "Step N" **마커만** 지우고, 지운 좌표계로 경계를 만든다.
 
-    헤더는 구간을 어디서 자를지 정하는 구분자로만 쓰고 forward pass 에서는 뺀다.
-    프로빙 때 "Step N" 토큰이나 헤더 제목("Identify the mission goal" 처럼 프롬프트가
-    지시해 스텝마다 거의 고정된 문구)을 보고 스텝 번호를 맞히는 치팅을 막기 위해서다.
-    서버 전체 궤적에서 헤더 100% 에 제목이 붙어 있고 제목만으로 스텝 번호가
-    99.8~100% 식별됐으므로 "Step N" 만 지우는 건 의미가 없어 줄 전체를 지운다.
+    마커는 구간을 어디서 자를지 정하는 구분자로만 쓰고 forward pass 에서는 뺀다.
+    프로빙 때 "Step N" 토큰을 보고 스텝 번호를 맞히는 치팅을 막기 위해서다.
 
-    지우는 범위는 헤더가 있는 줄의 시작부터 그 줄 끝의 개행, 그리고 바로 뒤에 오는
-    빈 줄들까지 (구간이 본문 첫 글자에서 시작하게). 헤더 줄에 본문이
-    같이 붙은 극소수 궤적(예: "Step 3. Determine ... to reach the ball at (12, 10)")은
-    그 문장을 잃지만 비율이 0.0% 수준이라 받아들인다.
+    지우는 범위는 STEP_PAT 매치("### Step 3." / "**Step 3:" 등) 와 그 뒤의 볼드 닫힘·가로 공백까지.
+    같은 줄의 나머지(제목이든 본문이든) 는 남긴다. 예전엔 헤더 줄 전체를 지웠는데, predict 는
+    "Step 1: The agent starts at (3, 4)..." 처럼 본문이 헤더 줄에 붙고 decompose 는 Step 6 이
+    제목 한 줄이라 전체의 15~70% 가 empty_segment 로 빠졌다. 제목("Identify the mission goal")
+    이 프롬프트가 지시한 고정 문구라 스텝 번호를 드러내는 문제는 남지만, 그건 본문 내용도
+    마찬가지이므로 프로빙 쪽에서 대조 실험(초반 층·cross-level)으로 가린다.
 
-    구간 시작은 헤더가 사라진 자리, 즉 각 스텝 본문의 첫 글자다. 헤더 줄 하나로 된
-    스텝(본문 없음)은 길이 0 이 되어 "empty_segment" 로 skip 된다.
+    마커만 있던 줄("Step 2: \n")은 줄 끝 개행과 뒤따르는 빈 줄까지 지워 구간이 본문 첫 글자에서
+    시작하게 한다. 남겨두면 본문이 "\n" 으로 시작해 앞 구간 끝의 "\n\n" 과 한 토큰으로 묶여
+    boundary_straddle 로 버려진다. 마커 뒤에 아무것도 없는 스텝은 길이 0 → "empty_segment".
     """
     heads, term, term_end, starts, reason = _segment(text, task)
     if reason is not None:
         return None, reason
 
-    spans = []                                   # 지울 [ls, le) — 헤더 줄 + 개행 + 뒤따르는 빈 줄
+    spans = []                                   # 지울 [ls, le)
     for m in heads:
-        ls = _line_start(text, m.start())
-        nl = text.find("\n", m.end())
-        le = nl + 1 if nl >= 0 else len(text)
-        # 헤더 뒤 빈 줄도 함께 지운다. 남겨두면 본문이 "\n" 으로 시작해 앞 구간 끝의
-        # "\n\n" 과 한 토큰("\n\n\n")으로 묶여 boundary_straddle 로 버려진다.
-        while le < len(text):
-            nl = text.find("\n", le)
-            end = nl + 1 if nl >= 0 else len(text)
-            if text[le:end].strip():
-                break
-            le = end
+        ls = m.start()                           # STEP_PAT 은 줄 머리(^)에서만 맞으므로 줄 시작과 같다
+        le = _AFTER_MARK.match(text, m.end()).end()
+        nl = text.find("\n", le)
+        line_end = nl + 1 if nl >= 0 else len(text)
+        if not text[le:line_end].strip():        # 마커만 있던 줄: 개행 + 뒤따르는 빈 줄까지
+            le = line_end
+            while le < len(text):
+                nl = text.find("\n", le)
+                end = nl + 1 if nl >= 0 else len(text)
+                if text[le:end].strip():
+                    break
+                le = end
         spans.append((ls, le))
-    # 헤더 줄은 모두 term 앞에서 끝난다 (starts[-1] < term 이고 term 은 줄 시작).
-    assert spans[-1][1] <= term, "header line crosses terminal"
+    # 마커는 모두 term 앞에서 끝난다 (starts[-1] < term 이고 빈 줄 소거는 term 줄 앞에서 멈춘다).
+    assert spans[-1][1] <= term, "header marker crosses terminal"
 
     def mapped(p: int) -> int:                   # 원문 위치 → 지운 좌표계
         return p - sum(le - ls for ls, le in spans if le <= p)
@@ -195,7 +199,7 @@ def prepare_output(text: str, task: str) -> tuple[Cleaned | None, str | None]:
     clean = "".join(pieces)
 
     clean_starts = [mapped(ls) for ls, _ in spans]
-    clean_starts[0] = 0                          # 원문처럼 첫 헤더 앞 공백은 Step 1 이 흡수
+    clean_starts[0] = 0                          # 원문처럼 첫 마커 앞 공백은 Step 1 이 흡수
     bounds = clean_starts + [mapped(term), len(clean)]
     if any(a >= b for a, b in zip(bounds, bounds[1:])):
         return None, "empty_segment"
@@ -238,7 +242,7 @@ def tokenize_text(prompt: str, output: str, char_bounds: list[int]):
 
     # 경계 양쪽 글자가 한 토큰으로 묶이면 경계를 토큰 단위로 못 그어서 한쪽 첫 토큰이
     # 조용히 앞 구간에 먹힌다. 프롬프트/출력 이음매는 템플릿이 \n\n 로 끝나 보통 안 생기지만,
-    # 헤더 줄을 벗긴 뒤의 스텝 이음매("...\n\n" + 본문 첫 글자)도 같은 위험이 있어 전부 검사한다.
+    # 마커를 벗긴 뒤의 스텝 이음매("...\n\n" + 본문 첫 글자)도 같은 위험이 있어 전부 검사한다.
     cuts = set(abs_bounds[1:-1])
     if any(s < c < e for s, e in enc.offset_mapping for c in cuts if s < c):
         return None, None, "boundary_straddle"
@@ -249,12 +253,12 @@ def tokenize_text(prompt: str, output: str, char_bounds: list[int]):
 
 
 def tokenize_episode(episode: dict, cleaned: Cleaned):
-    """프롬프트 + (헤더를 벗긴) 출력을 토크나이즈하고 토큰 경계를 만든다.
+    """프롬프트 + ("Step N" 마커를 벗긴) 출력을 토크나이즈하고 토큰 경계를 만든다.
 
     boundaries 규약 (길이 N+3):
         [0, 프롬프트 끝, step1 끝, ..., stepN 끝, 전체 끝]
     즉 첫 구간 = 프롬프트, 마지막 구간 = 정답 문장. 호출부가 이 규약을 안다고 가정한다.
-    스텝 구간에는 "Step N" 헤더 토큰이 없다 (prepare_output 참고).
+    스텝 구간에는 "Step N" 마커 토큰이 없다 (prepare_output 참고). 헤더 줄의 제목·본문은 남는다.
 
     반환: (input_ids, tok_bounds, 사유). 사유가 있으면 그 궤적은 skip.
     """
@@ -367,7 +371,7 @@ def process_episode(episode: dict, task: str, src_name: str) -> tuple[dict, dict
         n_tokens_output=boundaries[-1] - boundaries[1],   # 헤더 제외
         n_tokens_terminal=boundaries[-1] - boundaries[-2],
         n_steps=len(boundaries) - 3,         # 프롬프트·터미널 제외
-        n_header_chars=cleaned.n_header_chars,   # forward pass 에서 빠진 헤더 줄 문자 수
+        n_header_chars=cleaned.n_header_chars,   # forward pass 에서 빠진 "Step N" 마커 문자 수
     )
 
     if any(a >= b for a, b in zip(boundaries, boundaries[1:])):
@@ -386,7 +390,7 @@ def process_episode(episode: dict, task: str, src_name: str) -> tuple[dict, dict
 
 def chunk_header() -> dict:
     return {"model": MODEL, "boundary_layout": "prompt|steps|terminal",
-            "step_headers": "stripped",      # "Step N" 헤더 줄은 입력에서 뺐다 (prepare_output)
+            "step_headers": "marker_stripped",   # "Step N" 마커만 입력에서 뺐다, 제목·본문은 남음 (prepare_output)
             "label_priority": LABEL_PRIORITY}
 
 

@@ -4,6 +4,8 @@
 #     latent/spectral_states/<task>/<level>/{success,failure}/k8_scaled_sign-<mode>/chunk_*.pt
 # SOURCE=edges PART=both|front|back TAG_SUFFIX=_f5_b5 SPECTRAL_DIR=latent/spectral: 구간 앞5/뒤5 토큰별 e_i.
 #     latent/spectral/<task>/<level>/{success,failure}/k8_scaled_sign-<mode>_f5_b5/chunk_*.pt
+# SOURCE=pct PCT=40 TAG_SUFFIX=_p10-20-40-60-80-90-100 SPECTRAL_DIR=latent/spectral: 구간 40% 지점 누적 e.
+#     → out/probe_pct_40/
 # 레벨마다 에피소드 N_EPISODES 개만 쓴다 (success 우선, 모자라면 failure). 같은 SAMPLE_SEED 라
 # max / data 가 같은 에피소드 집합 위에서 비교된다.
 # 런들은 DEVICES 의 GPU 에 라운드로빈으로 배정되어 GPU 마다 하나씩 동시에 돈다 (probing.py --device).
@@ -14,6 +16,7 @@
 #   SEEDS="42" NO_BG=1 ./script/probe.sh         # 시드 1개, tmux 안에서 포그라운드로
 #   DEVICES="cpu" ./script/probe.sh              # sklearn CPU 경로 (느림)
 #   SOURCE=edges PART=front TAG_SUFFIX=_f5_b5 SPECTRAL_DIR=latent/spectral SIGN_MODES=data ./script/probe.sh
+#   SOURCE=pct PCT=40 TAG_SUFFIX=_p10-20-40-60-80-90-100 SPECTRAL_DIR=latent/spectral SIGN_MODES=data ./script/probe.sh
 #   SIGN_MODES="max" TASK_LEVELS="plan:CustomBabyAI-GoToRedBall-Small-4Dists-v0" ./script/probe.sh
 #   tail -f nohup_probe_*.out
 set -uo pipefail
@@ -29,12 +32,15 @@ if [[ "${PROBE_SH_BG:-}" != "1" && "${NO_BG:-}" != "1" ]]; then
     exit 0
 fi
 
-SOURCE="${SOURCE:-spectral}"                 # spectral | edges
+SOURCE="${SOURCE:-spectral}"                 # spectral | edges | pct
 PART="${PART:-both}"                         # edges 일 때: both | front | back
+PCT="${PCT:-100}"                            # pct 일 때: 저장본의 --pct 목록 중 하나
 TAG_SUFFIX="${TAG_SUFFIX:-}"                 # 새 포맷이면 _f5_b5 처럼 (옛 spectral_states 는 빈 문자열)
 SPECTRAL_DIR="${SPECTRAL_DIR:-latent/spectral_states}"
 if [[ "$SOURCE" == "edges" ]]; then
     OUT_ROOT="${OUT_ROOT:-out/probe_edges_${PART}}"
+elif [[ "$SOURCE" == "pct" ]]; then
+    OUT_ROOT="${OUT_ROOT:-out/probe_pct_${PCT}}"
 else
     OUT_ROOT="${OUT_ROOT:-out/probe_spectral}"
 fi
@@ -73,9 +79,11 @@ for tl in $TASK_LEVELS; do
     done
 done
 read -ra DEVS <<< "$DEVICES"
-echo "source=$SOURCE part=$PART tag_suffix=$TAG_SUFFIX spectral_dir=$SPECTRAL_DIR out=$OUT_ROOT"
+echo "source=$SOURCE part=$PART pct=$PCT tag_suffix=$TAG_SUFFIX spectral_dir=$SPECTRAL_DIR out=$OUT_ROOT"
 echo "runs=${#JOBS[@]} devices=${DEVS[*]} seeds=[$SEEDS] n_episodes=$N_EPISODES logs=$LOG_DIR"
-PART_ARGS=(); [[ "$SOURCE" == "edges" ]] && PART_ARGS=(--part "$PART")
+PART_ARGS=()
+[[ "$SOURCE" == "edges" ]] && PART_ARGS=(--part "$PART")
+[[ "$SOURCE" == "pct" ]] && PART_ARGS=(--pct "$PCT")
 
 run_one() {                       # run_one <device> <task> <level> <sign_mode>
     local dev="$1" task="$2" level="$3" sm="$4"

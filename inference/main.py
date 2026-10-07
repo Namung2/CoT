@@ -54,6 +54,8 @@ def parse_args():
     p.add_argument("--n-back", type=int, default=1,
                    help="구간 뒤에서 저장할 토큰별 e 개수. 1 이면 구간 마지막 e_t 만")
     p.add_argument("--all", action="store_true", help="구간의 모든 토큰 e 를 저장 (--n-front/--n-back 무시)")
+    p.add_argument("--pct", type=int, nargs="+", default=None, metavar="Q",
+                   help="구간 길이의 Q%% 지점들만 저장 (예: 10 20 40 60 80 90 100; --n-front/--n-back 무시)")
     p.add_argument("--dtype", default="float32", choices=list(DTYPES), help="e 저장 dtype")
     p.add_argument("--fallback-marker", nargs="+", default=[], metavar="TASK=S:T",
                    help="--n-front > 0 인데 원본 jsonl 에서 에피소드를 못 찾을 때 쓸 "
@@ -78,7 +80,7 @@ def main():
 
     configs = [(k, scale, sm) for k in a.k for scale in a.scale for sm in a.sign_mode]
     fallback = parse_fallback(a.fallback_marker)
-    select = ALL if a.all else Select(a.n_front, a.n_back)
+    select = ALL if a.all else Select.from_pct(a.pct) if a.pct else Select(a.n_front, a.n_back)
     for status in a.status:
         # extract 직후라 항상 다시 만든다 (낡은 청크 파일도 지움)
         stats = spectral_run(a.hidden_dir, a.spectral_dir, a.task, a.level, status, configs, select,

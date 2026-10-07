@@ -3,8 +3,8 @@
 모델은 안 태운다 (토크나이저만 필요). extract.py 와 같은 방식으로 토크나이즈한 뒤
   1. 특수 토큰의 offset 이 (0,0) 인지 실제 문자 범위인지
   2. 프롬프트/출력 경계가 토큰 단위로 정확히 갈리는지
-  3. 각 step 경계가 (헤더 줄이 빠진) 스텝 본문 첫 토큰 앞에 놓이고 "Step N" 토큰이 남지 않았는지
-를 눈으로 확인한다. extract.prepare_output 이 "Step N" 헤더 줄을 입력에서 빼므로
+  3. 각 step 경계가 ("Step N" 마커가 빠진) 스텝 첫 토큰 앞에 놓이고 "Step N" 토큰이 남지 않았는지
+를 눈으로 확인한다. extract.prepare_output 이 "Step N" 마커를 입력에서 빼므로
 여기서도 같은 함수로 벗긴 텍스트를 토크나이즈한다.
 
     python check_boundaries.py generation/trajectory/decompose_no_thinking.jsonl
@@ -35,14 +35,14 @@ def show(tok, episode, task, ctx=4):
     if reason is not None:
         print(f"  [skip] {reason}")
         return
-    output, char_bounds = cleaned.text, cleaned.bounds      # 헤더 줄이 빠진 출력
+    output, char_bounds = cleaned.text, cleaned.bounds      # 마커가 빠진 출력
     full = prompt + output
 
     enc = tok(full, add_special_tokens=False, return_offsets_mapping=True)
     ids, offs = enc.input_ids, enc.offset_mapping
 
     print(f"  tokens={len(ids)}  prompt_chars={len(prompt)}  output_chars={len(output)}"
-          f"  (헤더 {cleaned.n_header_chars}자 제거)")
+          f"  (마커 {cleaned.n_header_chars}자 제거)")
 
     # --- 1. 특수 토큰 offset 확인 -------------------------------------------
     special = tok.all_special_ids
