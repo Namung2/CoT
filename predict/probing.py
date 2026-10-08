@@ -1,55 +1,60 @@
 #!/usr/bin/env python
-"""chunk_*.pt 를 직접 읽어 step-wise one-vs-rest 선형 probe 학습 (마지막 레이어).
+"""chunk_*.pt ? ?? ?? step-wise one-vs-rest ?? probe ?? (??? ???).
 
-.pt 형식 (extract.py 출력):
+.pt ?? (extract.py ??):
     {"model": ..., "boundary_layout": "prompt|steps|terminal", "label_priority": ...,
      "episodes": {env_seed: {"E": bf16[n_tok, D],
                              "boundaries": [0, b_prompt, b_step1, ..., b_stepN, n_tok],
                              "output_sha1": str}}}
 
-boundaries 규약 (길이 N+3):
-    구간 = [프롬프트][step 1]...[step N][터미널]
-    b[0]=0, b[1]=프롬프트 끝, b[1+k]=step k 끝, b[-2]=step N 끝(=터미널 시작), b[-1]=전체 끝
+boundaries ?? (?? N+3):
+    ?? = [????][step 1]...[step N][???]
+    b[0]=0, b[1]=???? ?, b[1+k]=step k ?, b[-2]=step N ?(=??? ??), b[-1]=?? ?
 
-경로: <hidden_root>/<task>/<level>/<status>/chunk_*.pt
-    → group id = "<task>/<level>/<status>/<seed>"  (같은 level 이 여러 task 에 있으므로
-      task 까지 넣어야 glob 을 섞었을 때 충돌하지 않는다)
+??: <hidden_root>/<task>/<level>/<status>/chunk_*.pt
+    ? group id = "<task>/<level>/<status>/<seed>"  (?? level ? ?? task ? ????
+      task ?? ??? glob ? ??? ? ???? ???)
 
-대표 벡터: 구간의 마지막 토큰 E[end-1-offset].
-    step k 의 마지막 토큰 = "Step k+1" 마커 직전 토큰. 논문(Sun et al.)은 같은 벡터를
-    "Step k+1 activation" 이라 부른다 — 여기서는 구간 기준으로 step_k 라 부른다.
-    터미널 구간의 마지막 토큰은 "answer" 클래스.
+?? ??: ??? ??? ?? E[end-1-offset].
+    step k ? ??? ?? = "Step k+1" ?? ?? ??. ??(Sun et al.)? ?? ???
+    "Step k+1 activation" ?? ??? ? ???? ?? ???? step_k ? ???.
+    ??? ??? ??? ??? "answer" ???.
 
-    --with-prompt 를 주면 프롬프트 구간의 마지막 토큰도 "prompt" 클래스로 넣는다.
-    (논문의 "Step 1" 이 이 자리. 토큰 종류부터 달라서 거의 항상 분리되므로 기본은 제외)
+    --with-prompt ? ?? ???? ??? ??? ??? "prompt" ???? ???.
+    (??? "Step 1" ? ? ??. ?? ???? ??? ?? ?? ????? ??? ??)
 
-입력 종류 (--source). 라벨은 모두 같다: 해당 구간이면 참, 다른 구간이면 거짓.
-    hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
-                 --pct 10 20 … 100 을 주면 구간마다 q% 지점 토큰 E[s + pct_position(q, n)] 을 q 마다 하나씩
-                 샘플로 넣는다 (누적 없음, 그 위치의 마지막 레이어 벡터 그대로; 100 = 구간 마지막 토큰).
-                 학습은 모든 q 를 섞어 probe 하나를 만들고, 평가는 test 에피소드에서 q 마다 따로 잰다
-                 (summary.json 의 by_pct, summary.png 는 q 축 AUC 곡선). 짧은 구간에서 여러 q 가 같은
-                 토큰을 가리켜도 q 마다 행을 따로 둔다. --offset 은 --pct 와 같이 못 쓴다.
-    spectral [2] latent/spectral 저장본의 구간 마지막 e_t (e[t][-1], 구간마다 kd 벡터 하나).
-                 n_back ≥ 1 이거나 --all 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
-                 옛 latent/spectral_states 포맷 (e[t] 가 (kd,) 하나, seg/pos 없음) 도 그대로 읽는다.
-    edges    [3-5] 같은 저장본의 구간 안 토큰별 누적 e_i (inference/spectral.py --n-front 5 --n-back 5).
-                 누적은 구간 시작에서 리셋되고 e_i 하나하나가 샘플이다. --all 로 저장한 파일은 --part both 만 된다.
-                 --part both  [3] "Step N" 헤더 토큰을 뺀 앞 5개 + 마지막 5개
-                 --part front [4] 헤더를 뺀 앞 5개
-                 --part back  [5] 마지막 5개 (맨 끝 하나 = [2] 의 e_t)
-                 터미널 구간은 정답 앞 형식 문구("<START>" 등)를 헤더처럼 뺀다.
-                 형식 문구 + 앞 5 + 뒤 5 보다 짧은 구간은 3/4/5 모두에서 뺀다 (--keep-short 로 끔).
-                 --k / --sign-mode 로 spectral 설정을 고른다.
-    pct      [6] 같은 저장본 중 --pct 로 저장한 파일 (inference/spectral.py --pct 10 20 … 100) 에서
-                 구간 길이의 Q% 지점까지 누적한 e 하나 (--pct Q 로 지점을 고른다, 구간마다 샘플 하나).
-                 위치는 spectral.pct_position 으로 되찾는다. 100 은 [2] 의 e_t 와 같다.
-                 t < k 인 지점(짧은 구간의 작은 Q) 도 거르지 않고 넣는다; 개수만 stats 의 t_lt_k 로 센다.
-    --max-step M 은 step M 까지만 probe 한다. --drop-above-max 를 같이 주면 그 뒤 step 은
-    음성 샘플에서도 빠진다.
-    분할은 어느 입력이든 에피소드 단위라 같은 에피소드의 샘플이 train/test 에 섞이지 않는다.
-    --n-episodes N 을 주면 로딩 뒤 에피소드 N 개만 남긴다 (success 먼저, 모자라면 failure 로 채움,
-    --sample-seed 로 고정). 남긴 에피소드 목록은 <output>/episodes.json 에 쓴다.
+?? ?? (--source). ??? ?? ??: ?? ???? ?, ?? ???? ??.
+    hidden   [1] hidden_states ? ?? ??? ?? (? ??)
+                 --pct 10 20 ? 100 ? ?? ???? q% ?? ?? E[s + pct_position(q, n)] ? q ?? ???
+                 ??? ??? (?? E ??? ?? ???? hidden_states ????? ??? ??; 100 = ?? ??? ??).
+                 probe ? ?? q ? ?? ?? ??? ????, ??? test ? q ?? ?? ?? ??
+                 (summary.json ? by_pct, summary.png ? q ? AUC ??). --offset ? --pct ? ?? ? ??.
+                 ?? E ? ?? spectral.py --with-hidden ???? ??? --source pct --input hidden ? ??.
+    spectral [2] latent/spectral ???? ?? ??? e_t (e[t][-1], ???? kd ?? ??).
+                 n_back ? 1 ??? --all ? ??? ???? ?? ??? ??. --with-prompt/--offset ? ????.
+                 ? latent/spectral_states ?? (e[t] ? (kd,) ??, seg/pos ??) ? ??? ???.
+    edges    [3-5] ?? ???? ?? ? ??? ?? e_i (inference/spectral.py --n-front 5 --n-back 5).
+                 ??? ?? ???? ???? e_i ????? ????. --all ? ??? ??? --part both ? ??.
+                 --part both  [3] "Step N" ?? ??? ? ? 5? + ??? 5?
+                 --part front [4] ??? ? ? 5?
+                 --part back  [5] ??? 5? (? ? ?? = [2] ? e_t)
+                 ??? ??? ?? ? ?? ??("<START>" ?)? ???? ??.
+                 ?? ?? + ? 5 + ? 5 ?? ?? ??? 3/4/5 ???? ?? (--keep-short ? ?).
+                 --k / --sign-mode ? spectral ??? ???.
+    pct      [6] ?? ??? ? --pct ? ??? ?? (inference/spectral.py --pct 10 20 ? 100) ??
+                 ?? ??? Q% ???? ??? e ?? (--pct Q ? ??? ???, ???? ?? ??).
+                 ??? spectral.pct_position ?? ????. 100 ? [2] ? e_t ? ??.
+                 t < k ? ??(?? ??? ?? Q) ? ??? ?? ???; ??? stats ? t_lt_k ? ??.
+                 --min-len L ? ?? ?? L ?? ??? ?? (?? ???? ?? Q ? ?? ??? ???? ?? ?? ?).
+    --input hidden|spectral  (edges / pct) ???? ?? ??? ??. spectral(??) = ?? gram e (kd ??),
+                 hidden = ?? ??? hidden state ? h (d ??; spectral.py --with-hidden ?? ??? _h ?? ???).
+                 ?? pos ?? e ? h ? ??? ??? "??? vs gram" ??? ?? ?? ?? ??? ??.
+    ??: acc / f1 / auc ? ?? margin = ? ??? ??? ?? (acc ? 1.0 ? ??? ??? ???? ??? ??).
+    --max-step M ? step M ??? probe ??. --drop-above-max ? ?? ?? ? ? step ?
+    ?? ????? ???.
+    ??? ?? ???? ???? ??? ?? ????? ??? train/test ? ??? ???.
+    --n-episodes N ? ?? ?? ? ???? N ?? ??? (success ??, ???? failure ? ??,
+    --sample-seed ? ??). ?? ???? ??? <output>/episodes.json ? ??.
 
 Usage:
     python probing.py --pt 'latent/hidden_states/plan/*/*/chunk_*.pt' --output out/plan_all
@@ -62,7 +67,11 @@ Usage:
     python probing.py --source pct --pct 40 \
         --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_p10-20-40-60-80-90-100/chunk_*.pt' --output out/pct_40
     python probing.py --pt 'latent/hidden_states_marker/decompose/BabyAI-GoToObj-v0/*/chunk_*.pt' \
-        --pct 10 20 40 60 80 90 100 --output out/hidden_pct_gotoobj          # 학습 전체, 평가 q 별
+        --pct 10 20 40 60 80 90 100 --output out/hidden_pct_gotoobj   # ?? E ?? ??, q ? ??
+    python probing.py --source pct --pct 5 --input hidden --min-len 20 \
+        --pt 'latent/spectral/decompose/BabyAI-GoToObj-v0/*/k8_scaled_sign-data_p1-5-10-20-50-80-90-95-99-100_h/chunk_*.pt' \
+        --output out/pct_h_05                       # ?? ????? --input spectral ? ??? gram ?
+    (?? % ? ? ?? ?? ????: script/pct_curve.py)
 """
 import sys
 import json
@@ -83,13 +92,13 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "inference"))
-from spectral import pct_position  # noqa: E402  (저장 때와 같은 q% → 위치 규칙)
+from spectral import pct_position  # noqa: E402  (?? ?? ?? q% ? ?? ??)
 
-PROMPT_LABEL = 0          # step_num 0 = 프롬프트 끝
-ANSWER_LABEL = -1         # step_num -1 = 터미널(정답 문장)
+PROMPT_LABEL = 0          # step_num 0 = ???? ?
+ANSWER_LABEL = -1         # step_num -1 = ???(?? ??)
 
 
-# ---------------------------------------------------------------- .pt 로딩
+# ---------------------------------------------------------------- .pt ??
 
 SOURCES = ("hidden", "spectral", "edges", "pct")
 
@@ -110,23 +119,23 @@ def _gid(p: Path, source: str, seed) -> str:
 
 
 def load_pt(patterns, offset, with_prompt=False, pct=None):
-    """[1] hidden_states: 구간 마지막 토큰 E[end-1-offset] 하나.
-    pct 가 있으면 구간마다 q% 지점 토큰을 q 마다 하나씩 (offset 은 0 이어야 한다). 행마다 q 를 Ps 에 남긴다."""
+    """[1] hidden_states: ?? ??? ?? E[end-1-offset] ??.
+    pct ? ?? ???? q% ?? ??? q ?? ??? (offset ? 0 ??? ??). ??? q ? Ps ? ???."""
     Xs, Ns, Gs, Ps = [], [], [], []
     stats = Counter()
     if pct and offset:
-        raise SystemExit("--pct 와 --offset 은 같이 못 쓴다")
+        raise SystemExit("--pct ? --offset ? ?? ? ??")
 
     for p in _paths(patterns):
         d = torch.load(p, map_location="cpu", weights_only=False)
 
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "hidden", seed)
-            E = ep["E"]                                   # bf16 torch 그대로 (GPU 경로가 그대로 올린다)
+            E = ep["E"]                                   # bf16 torch ??? (GPU ??? ??? ???)
             b = [int(x) for x in ep["boundaries"]]
             n_tok = E.shape[0]
 
-            # 규약: [0, prompt, step1..stepN, terminal 끝] → 최소 길이 4 (step 1개)
+            # ??: [0, prompt, step1..stepN, terminal ?] ? ?? ?? 4 (step 1?)
             if len(b) < 4 or b[0] != 0 or b[-1] != n_tok:
                 stats["bad_boundaries"] += 1
                 continue
@@ -136,7 +145,7 @@ def load_pt(patterns, offset, with_prompt=False, pct=None):
             stats["episodes"] += 1
 
             def take(start, end, label):
-                if pct:                                       # q% 지점 토큰, q 마다 한 행
+                if pct:                                       # q% ?? ???, q ?? ? ?
                     for q in pct:
                         i = start + pct_position(q, end - start)
                         Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(q)
@@ -145,38 +154,38 @@ def load_pt(patterns, offset, with_prompt=False, pct=None):
                 if i < start:
                     stats["segment_too_short"] += 1
                     return
-                Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(100)  # view 면 E 전체가 살아남아 300GB 까지 감
+                Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(100)  # view ? E ??? ???? 300GB ?? ?
 
-            if with_prompt:                                   # 프롬프트는 항상 마지막 토큰 하나
+            if with_prompt:                                   # ????? ?? ??? ?? ??
                 i = b[1] - 1 - offset
                 Xs.append(E[i].clone()); Ns.append(PROMPT_LABEL); Gs.append(gid); Ps.append(100)
             for k, (s, e) in enumerate(zip(b[1:-2], b[2:-1]), start=1):   # step 1..N
                 take(s, e, k)
-            take(b[-2], b[-1], ANSWER_LABEL)                              # 터미널
+            take(b[-2], b[-1], ANSWER_LABEL)                              # ???
 
     return _pack(Xs, Ns, Gs, stats, Ps)
 
 
 def _seg_label(t: int, n_seg: int) -> int:
-    """gen_view 구간 번호 t (0..N-1 = step 1..N, N = 터미널) → step_num."""
+    """gen_view ?? ?? t (0..N-1 = step 1..N, N = ???) ? step_num."""
     return ANSWER_LABEL if t == n_seg - 1 else t + 1
 
 
 def _config_ok(d, p, k, sign_mode, seen, stats):
-    """헤더의 k / sign_mode 로 파일을 거른다. 서로 다른 설정이 섞이면 차원이 달라 멈춘다."""
+    """??? k / sign_mode ? ??? ???. ?? ?? ??? ??? ??? ?? ???."""
     cfg = (d.get("k"), d.get("sign_mode"), d.get("scale"))
     if (k is not None and cfg[0] != k) or (sign_mode is not None and cfg[1] != sign_mode):
         stats["file_config_skipped"] += 1
         return False
     seen.add(cfg)
     if len(seen) > 1:
-        raise SystemExit(f"서로 다른 spectral 설정이 섞였다 {sorted(seen, key=str)} — "
-                         f"--k / --sign-mode 로 하나만 고르거나 glob 을 좁힐 것 ({p})")
+        raise SystemExit(f"?? ?? spectral ??? ??? {sorted(seen, key=str)} ? "
+                         f"--k / --sign-mode ? ??? ???? glob ? ?? ? ({p})")
     return True
 
 
 def load_spectral(patterns, k=None, sign_mode=None):
-    """[2] spectral: 구간 전체를 누적한 e_t = e[t][-1] (구간마다 하나, 마지막 위치가 저장된 구간만)."""
+    """[2] spectral: ?? ??? ??? e_t = e[t][-1] (???? ??, ??? ??? ??? ???)."""
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
     for p in _paths(patterns):
@@ -189,27 +198,36 @@ def load_spectral(patterns, k=None, sign_mode=None):
             stats["episodes"] += 1
             for t in sorted(ep["e"]):
                 row = ep["e"][t]
-                if row.dim() == 1:                                    # 옛 spectral_states: 구간마다 e_t 하나
+                if row.dim() == 1:                                    # ? spectral_states: ???? e_t ??
                     Xs.append(row.clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
                     continue
                 ps = ep["pos"][t]
-                if not ps or ps[-1] != seg[t + 1] - seg[t] - 1:      # 마지막 토큰이 저장돼 있어야 e_t
+                if not ps or ps[-1] != seg[t + 1] - seg[t] - 1:      # ??? ??? ??? ??? e_t
                     stats["no_last_token"] += 1
                     continue
                 Xs.append(row[-1].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
-def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
-    """[3-5] edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
+def _vec_key(d, p, inp):
+    """????? ?? ?. hidden ?? --with-hidden ?? ??? ????? ??."""
+    if inp == "hidden":
+        if not d.get("hidden"):
+            raise SystemExit(f"{p}: hidden ?? ??? ?? ?? (spectral.py --with-hidden ?? ?? _h ?? ?? ??)")
+        return "h"
+    return "e"
 
-    part: both (3) | front (4) | back (5). e_i 하나하나가 샘플이고 라벨은 그 구간.
-    저장본은 위치 pos 와 e 만 갖고 있으므로 front/back 은 헤더의 n_front/n_back 과 marker 로 가른다:
-    front = marker ≤ p < marker+n_front, back = p ≥ n-n_back. --all 저장본은 part both 만 된다.
 
-    짧은 구간 제외: 구간 길이 < marker + n_front + n_back 이면 (앞/뒤가 겹치거나 모자람)
-    그 구간은 통째로 뺀다 — 양성으로도 음성으로도 안 쓴다. part 와 상관없이 같은 기준이라
-    3/4/5 가 같은 구간 집합 위에서 비교된다. keep_short=True 면 끈다 (all 저장본은 해당 없음).
+def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False, inp="spectral"):
+    """[3-5] edges: ?? ? ??? ?? e_i ? ?(?? ?? ??)/? ????.
+
+    part: both (3) | front (4) | back (5). e_i ????? ???? ??? ? ??.
+    ???? ?? pos ? e ? ?? ???? front/back ? ??? n_front/n_back ? marker ? ???:
+    front = marker ? p < marker+n_front, back = p ? n-n_back. --all ???? part both ? ??.
+
+    ?? ?? ??: ?? ?? < marker + n_front + n_back ?? (?/?? ???? ???)
+    ? ??? ??? ?? ? ????? ????? ? ??. part ? ???? ?? ????
+    3/4/5 ? ?? ?? ?? ??? ????. keep_short=True ? ?? (all ???? ?? ??).
     """
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
@@ -219,7 +237,8 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
             continue
         n_front, n_back, is_all = d["n_front"], d["n_back"], d.get("all", False)
         if is_all and part != "both":
-            raise SystemExit(f"--all 로 저장한 파일은 --part both 만 가능 ({p})")
+            raise SystemExit(f"--all ? ??? ??? --part both ? ?? ({p})")
+        key = _vec_key(d, p, inp)
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "edges", seed)
             n_seg = len(ep["e"])
@@ -232,7 +251,7 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
                     stats[f"short_{target_name(_seg_label(t, n_seg))}"] += 1
                     if not keep_short:
                         continue
-                for pos, row in zip(ep["pos"][t], ep["e"][t]):
+                for pos, row in zip(ep["pos"][t], ep[key][t]):
                     if part == "front" and not (m <= pos < m + n_front):
                         continue
                     if part == "back" and pos < n - n_back:
@@ -241,12 +260,14 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
     return _pack(Xs, Ns, Gs, stats)
 
 
-def load_pct(patterns, pct, k=None, sign_mode=None):
-    """[6] pct: 구간 길이의 pct% 지점까지 누적한 e (구간마다 하나). --pct 로 저장한 파일만 읽는다.
+def load_pct(patterns, pct, k=None, sign_mode=None, inp="spectral", min_len=0):
+    """[6] pct: ?? ??? pct% ???? ??? e (?? ?? ??? hidden ? h; inp) ? ???? ??.
+    --pct ? ??? ??? ???.
 
-    저장본은 pos 와 e 만 갖고 있으므로 pct_position(pct, n) 으로 위치를 되찾아 그 행을 꺼낸다.
-    짧은 구간에서 여러 % 가 같은 위치로 합쳐져도 위치는 반드시 있다. 거르지 않는다 —
-    t < k 인 지점(그람 rank 부족) 개수만 t_lt_k 로 센다."""
+    ???? pos ? e/h ? ?? ???? pct_position(pct, n) ?? ??? ??? ? ?? ???.
+    ?? ???? ?? % ? ?? ??? ???? ??? ??? ??. ??? ??? ??? ?
+    t < k ? ??(?? rank ??) ??? t_lt_k ? ??. min_len > 0 ?? ??? ?? ??? ??
+    (short_segment ? ??) ? ??·?? ?? ???? ? ??."""
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
     for p in _paths(patterns):
@@ -254,14 +275,18 @@ def load_pct(patterns, pct, k=None, sign_mode=None):
         if not _config_ok(d, p, k, sign_mode, seen, stats):
             continue
         if pct not in d.get("pct", []):
-            raise SystemExit(f"{p}: {pct}% 지점이 저장돼 있지 않다 (저장된 pct={d.get('pct')})")
+            raise SystemExit(f"{p}: {pct}% ??? ??? ?? ?? (??? pct={d.get('pct')})")
+        key = _vec_key(d, p, inp)
         k_eig = d["k"]
         for seed, ep in d["episodes"].items():
-            gid = _gid(p, "edges", seed)                      # spectral/edges 와 같은 경로 규칙
+            gid = _gid(p, "edges", seed)                      # spectral/edges ? ?? ?? ??
             seg, n_seg = ep["seg"], len(ep["e"])
             stats["episodes"] += 1
             for t in range(n_seg):
                 n = seg[t + 1] - seg[t]
+                if n < min_len:
+                    stats["short_segment"] += 1
+                    continue
                 want = pct_position(pct, n)
                 ps = ep["pos"][t]
                 if want not in ps:
@@ -269,34 +294,34 @@ def load_pct(patterns, pct, k=None, sign_mode=None):
                     continue
                 if want + 1 < k_eig:
                     stats["t_lt_k"] += 1
-                Xs.append(ep["e"][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                Xs.append(ep[key][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats, pct_value=pct)
 
 
 def _pack(Xs, Ns, Gs, stats, Ps=None, pct_value=100):
-    """행 목록 → data. X 는 torch 텐서로, 저장 dtype 그대로 둔다 (bf16 저장본이면 bf16 — fp32 로 바꾸면
-    edges 는 수십 GB 가 두 배가 된다). CPU(sklearn) 경로는 main 에서 한 번 float32 numpy 로 바꾼다.
-    pct: 행마다 "구간의 몇 % 지점인가" (Ps 가 없으면 전부 pct_value). 평가를 % 별로 나눌 때 쓴다."""
+    """? ?? ? data. X ? torch ???, ?? dtype ??? ?? (bf16 ????? bf16 ? fp32 ? ???
+    edges ? ?? GB ? ? ?? ??). CPU(sklearn) ??? main ?? ? ? float32 numpy ? ???.
+    pct: ??? "??? ? % ????" (Ps ? ??? ?? pct_value). ?? % ? ?? ?? ? q ? ??? ??."""
     if not Xs:
-        raise SystemExit("벡터 없음 — 입력 경로/규약 확인")
+        raise SystemExit("?? ?? ? ?? ??/?? ??")
     X = torch.stack(Xs)
     Xs.clear()
     P = np.array(Ps if Ps is not None else [pct_value] * len(Ns), np.int32)
     data = dict(X=X, step_num=np.array(Ns, np.int32), group=np.array(Gs, dtype=object), pct=P)
     print(f"loaded: {dict(stats)}")
     print(f"  X={tuple(X.shape)} {str(X.dtype).removeprefix('torch.')}  "
-          f"구간별 개수={dict(sorted(Counter(Ns).items()))}  groups={len(set(Gs))}"
-          + (f"  pct별 개수={dict(sorted(Counter(P.tolist()).items()))}" if len(set(P.tolist())) > 1 else ""))
+          f"??? ??={dict(sorted(Counter(Ns).items()))}  groups={len(set(Gs))}"
+          + (f"  pct? ??={dict(sorted(Counter(P.tolist()).items()))}" if len(set(P.tolist())) > 1 else ""))
     return data
 
 
 def _take(data, idx):
-    """행 인덱스로 data 를 줄인다 (X 는 torch, 나머지는 numpy)."""
+    """? ???? data ? ??? (X ? torch, ???? numpy)."""
     idx = np.asarray(idx)
     return {k: (v[torch.as_tensor(idx)] if torch.is_tensor(v) else v[idx]) for k, v in data.items()}
 
 
-# ---------------------------------------------------------------- 데이터셋 / 모델
+# ---------------------------------------------------------------- ???? / ??
 
 def target_name(label: int) -> str:
     if label == PROMPT_LABEL:
@@ -307,10 +332,10 @@ def target_name(label: int) -> str:
 
 
 def subsample_episodes(data, n, seed):
-    """에피소드(group) 단위로 n 개만 남긴다. success 를 먼저 채우고 모자라면 failure 로.
+    """????(group) ??? n ?? ???. success ? ?? ??? ???? failure ?.
 
-    group id 는 "<task>/<level>/<status>/<seed>" 라 status 를 여기서 읽는다. success 가 n 보다
-    많으면 그 안에서 n 개를 무작위로 고른다. 반환: (줄인 data, 남긴 group 목록 정렬)."""
+    group id ? "<task>/<level>/<status>/<seed>" ? status ? ??? ???. success ? n ??
+    ??? ? ??? n ?? ???? ???. ??: (?? data, ?? group ?? ??)."""
     groups = np.unique(data["group"])
     status = np.array([g.split("/")[2] for g in groups])
     rng = np.random.default_rng(seed)
@@ -319,20 +344,20 @@ def subsample_episodes(data, n, seed):
     keep = np.concatenate([succ[:n], fail[:max(0, n - len(succ))]])
     mask = np.isin(data["group"], keep)
     print(f"--n-episodes {n}: success {min(n, len(succ))}/{len(succ)} + failure "
-          f"{max(0, n - len(succ))}/{len(fail)} → {len(keep)} episodes, X={int(mask.sum())} rows")
+          f"{max(0, n - len(succ))}/{len(fail)} ? {len(keep)} episodes, X={int(mask.sum())} rows")
     if not mask.all():
         data = _take(data, np.flatnonzero(mask))
     return data, sorted(keep.tolist())
 
 
 def make_binary(data, label):
-    """one-vs-rest 라벨: 해당 구간이 1, 나머지 구간 전부 0. X 는 복사하지 않는다 (edges 는 수십 GB)."""
+    """one-vs-rest ??: ?? ??? 1, ??? ?? ?? 0. X ? ???? ??? (edges ? ?? GB)."""
     y = (data["step_num"] == label).astype(int)
     return data["X"], y, data["group"]
 
 
 def split(n, y, g, test_size, seed, group):
-    """행 인덱스 (train, test). group=True 면 에피소드 단위."""
+    """? ??? (train, test). group=True ? ???? ??."""
     dummy = np.empty((n, 0))
     if group:
         return next(GroupShuffleSplit(1, test_size=test_size, random_state=seed).split(dummy, y, g))
@@ -340,8 +365,8 @@ def split(n, y, g, test_size, seed, group):
 
 
 class GpuData:
-    """X 전체를 GPU 에 한 번만 올려 두고 (저장 dtype 그대로 — bf16 이면 fp32 의 절반), fit / predict 가
-    행 인덱스를 청크씩 꺼내 fp32 로 바꿔 쓴다. 70만 x 40960 bf16 ≈ 57GB 가 GPU 에 상주한다."""
+    """X ??? GPU ? ? ?? ?? ?? (?? dtype ??? ? bf16 ?? fp32 ? ??), fit / predict ?
+    ? ???? ??? ?? fp32 ? ?? ??. 70? x 40960 bf16 ? 57GB ? GPU ? ????."""
 
     def __init__(self, X: torch.Tensor, device, chunk: int = 32768):
         self.device = torch.device(device)
@@ -349,20 +374,20 @@ class GpuData:
         self.chunk = chunk
 
     def batches(self, idx):
-        """idx 순서대로 (m x D) fp32 청크를 낸다."""
+        """idx ???? (m x D) fp32 ??? ??."""
         idx_t = torch.as_tensor(np.asarray(idx), device=self.device)
         for i in range(0, len(idx_t), self.chunk):
             yield self.X[idx_t[i:i + self.chunk]].float()
 
 
 class TorchLogReg:
-    """GPU 로지스틱 회귀. sklearn LogisticRegression(C, L2, class_weight="balanced") 과 같은 목적함수
+    """GPU ???? ??. sklearn LogisticRegression(C, L2, class_weight="balanced") ? ?? ????
 
-        C · Σ_i w_i · logloss_i(β)  +  ½‖β_w‖²      (w_i = n / (2·n_class(i)), 절편은 벌점 없음)
+        C · ?_i w_i · logloss_i(?)  +  ½??_w?²      (w_i = n / (2·n_class(i)), ??? ?? ??)
 
-    를 torch L-BFGS(strong Wolfe) 로 푼다. 손실과 기울기는 GpuData 청크를 돌며 해석적으로 누적하므로
-    autograd 그래프도, X 의 fp32 복사본도 만들지 않는다. scale=True 면 StandardScaler 와 같은 표준화
-    (학습 행 기준 평균/표준편차, 2-pass) 를 내장한다. 학습 뒤 파라미터는 CPU 에 둬서 pickle 가능."""
+    ? torch L-BFGS(strong Wolfe) ? ??. ??? ???? GpuData ??? ?? ????? ?????
+    autograd ????, X ? fp32 ???? ??? ???. scale=True ? StandardScaler ? ?? ???
+    (?? ? ?? ??/????, 2-pass) ? ????. ?? ? ????? CPU ? ?? pickle ??."""
 
     def __init__(self, C=1.0, scale=True, max_iter=500, tol=1e-5):
         self.C, self.scale, self.max_iter, self.tol = C, scale, max_iter, tol
@@ -374,7 +399,7 @@ class TorchLogReg:
         w_t = torch.where(y_t > 0.5, torch.tensor(n / (2 * n_pos), device=dev),
                           torch.tensor(n / (2 * (n - n_pos)), device=dev))        # balanced
 
-        if self.scale:                                                           # 2-pass 평균/표준편차
+        if self.scale:                                                           # 2-pass ??/????
             mean = torch.zeros(d, device=dev)
             for xb in gd.batches(idx):
                 mean += xb.sum(0)
@@ -430,10 +455,10 @@ class TorchLogReg:
 
 
 def fit(Xnp, gd, y, idx, seed, cv, scale):
-    """Xnp: CPU 경로용 float32 numpy (GPU 경로면 None). gd: GpuData (CPU 경로면 None)."""
+    """Xnp: CPU ??? float32 numpy (GPU ??? None). gd: GpuData (CPU ??? None)."""
     if gd is not None:
         if cv:
-            raise SystemExit("--cv 는 --device cpu 에서만 된다")
+            raise SystemExit("--cv ? --device cpu ??? ??")
         return TorchLogReg(C=1.0, scale=scale).fit(gd, idx, y[idx])
     if cv:
         lr = LogisticRegressionCV(Cs=np.logspace(-4, 2, 7), cv=5, scoring="roc_auc",
@@ -445,51 +470,58 @@ def fit(Xnp, gd, y, idx, seed, cv, scale):
 
 
 def evaluate(clf, Xnp, gd, idx, y):
+    """acc / f1 / auc + margin. margin = ? ???? ? ??? ?? (y=1 ?? p, y=0 ?? 1-p):
+    0.5 = ??, 1.0 = ?? ??. acc ? ???? ??? ?? ???? ??? ???."""
     p = clf.predict_proba(gd, idx)[:, 1] if gd is not None else clf.predict_proba(Xnp[idx])[:, 1]
     yhat = (p > 0.5).astype(int)
     return dict(acc=accuracy_score(y, yhat), f1=f1_score(y, yhat, zero_division=0),
-                auc=roc_auc_score(y, p))
+                auc=roc_auc_score(y, p), margin=float(np.mean(np.where(y == 1, p, 1 - p))))
 
 
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pt", nargs="+", required=True, help="chunk_*.pt glob (여러 개 가능)")
+    ap.add_argument("--pt", nargs="+", required=True, help="chunk_*.pt glob (?? ? ??)")
     ap.add_argument("--source", choices=SOURCES, default="hidden",
-                    help="hidden: 구간 마지막 토큰 hidden (1) | spectral: 구간 전체 누적 e_t (2) | "
-                         "edges: 구간 앞/뒤 토큰별 누적 e_i (3-5, --part) | pct: 구간 Q%% 지점 누적 e (6, --pct)")
+                    help="hidden: ?? ??? ?? hidden (1) | spectral: ?? ?? ?? e_t (2) | "
+                         "edges: ?? ?/? ??? ?? e_i (3-5, --part) | pct: ?? Q%% ?? ?? e (6, --pct)")
     ap.add_argument("--pct", type=int, nargs="+", default=None, metavar="Q",
-                    help="hidden: 구간 길이의 Q%% 지점 토큰들 (여러 개; 학습은 전부 섞고 평가는 Q 별) | "
-                         "pct 소스: 저장본의 --pct 목록 중 하나 (100 = 구간 끝)")
+                    help="hidden: ?? ??? Q%% ?? ??? (?? ?; ??? ???? ??? Q ?) | "
+                         "pct ??: ???? --pct ?? ? ?? (100 = ?? ?)")
     ap.add_argument("--part", choices=("both", "front", "back"), default="both",
-                    help="--source edges 일 때: both=앞5+뒤5 (3), front=헤더 뺀 앞5 (4), back=뒤5 (5)")
+                    help="--source edges ? ?: both=?5+?5 (3), front=?? ? ?5 (4), back=?5 (5)")
     ap.add_argument("--k", type=int, default=None,
-                    help="spectral/edges: 이 k 인 파일만 쓴다 (기본: glob 이 잡은 그대로)")
+                    help="spectral/edges: ? k ? ??? ?? (??: glob ? ?? ???)")
     ap.add_argument("--sign-mode", default=None, choices=("none", "first", "max", "data"),
-                    help="spectral/edges: 이 부호 규칙인 파일만 쓴다")
+                    help="spectral/edges: ? ?? ??? ??? ??")
     ap.add_argument("--keep-short", action="store_true",
-                    help="edges: marker+앞+뒤 보다 짧은 구간도 넣는다 (기본은 제외)")
+                    help="edges: marker+?+? ?? ?? ??? ??? (??? ??)")
+    ap.add_argument("--input", choices=("spectral", "hidden"), default="spectral",
+                    help="edges/pct ????? ?? gram e(spectral) ? ??, ?? ??? hidden ? h ? ?? "
+                         "(h ? spectral.py --with-hidden ?? ??? _h ???? ??)")
+    ap.add_argument("--min-len", type=int, default=0,
+                    help="pct: ? ??(??) ?? ??? ???? ?? (?? %% ? ? ??? ???? ?? ?? ??)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--offset", type=int, default=0,
-                    help="구간 마지막 토큰에서 몇 칸 앞을 대표로 쓸지 (ablation)")
+                    help="?? ??? ???? ? ? ?? ??? ?? (ablation)")
     ap.add_argument("--with-prompt", action="store_true",
-                    help="프롬프트 구간 마지막 토큰도 클래스로 포함")
+                    help="???? ?? ??? ??? ???? ??")
     ap.add_argument("--max-step", type=int, default=None,
-                    help="이 번호를 넘는 step 은 probe 대상에서 제외 (기본: negative 로는 남음)")
+                    help="? ??? ?? step ? probe ???? ?? (??: negative ?? ??)")
     ap.add_argument("--drop-above-max", action="store_true",
-                    help="--max-step 을 넘는 step 샘플을 데이터에서 아예 뺀다 (negative 로도 안 씀)")
+                    help="--max-step ? ?? step ??? ????? ?? ?? (negative ?? ? ?)")
     ap.add_argument("--n-episodes", type=int, default=None,
-                    help="로딩 뒤 에피소드 이 개수만 사용 (success 우선, 모자라면 failure 로 채움)")
-    ap.add_argument("--sample-seed", type=int, default=0, help="--n-episodes 추출 시드")
+                    help="?? ? ???? ? ??? ?? (success ??, ???? failure ? ??)")
+    ap.add_argument("--sample-seed", type=int, default=0, help="--n-episodes ?? ??")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456, 789, 1011])
     ap.add_argument("--test-size", type=float, default=0.2)
     ap.add_argument("--no-group-split", action="store_true",
-                    help="에피소드 단위 분할을 끈다 (같은 에피소드가 train/test 로 쪼개짐)")
+                    help="???? ?? ??? ?? (?? ????? train/test ? ???)")
     ap.add_argument("--no-scale", action="store_true")
     ap.add_argument("--cv", action="store_true")
     ap.add_argument("--device", default="cpu",
-                    help="cpu: sklearn LogisticRegression | cuda[:i]: 같은 목적함수를 torch L-BFGS 로 (TorchLogReg)")
+                    help="cpu: sklearn LogisticRegression | cuda[:i]: ?? ????? torch L-BFGS ? (TorchLogReg)")
     a = ap.parse_args()
 
     a.output.mkdir(parents=True, exist_ok=True)
@@ -502,40 +534,41 @@ def main():
         data = load_spectral(a.pt, a.k, a.sign_mode)
     elif a.source == "pct":
         if a.pct is None or len(a.pct) != 1:
-            raise SystemExit("--source pct 는 --pct Q 하나가 필요하다")
-        data = load_pct(a.pt, a.pct[0], a.k, a.sign_mode)
+            raise SystemExit("--source pct ? --pct Q ??? ????")
+        data = load_pct(a.pt, a.pct[0], a.k, a.sign_mode, a.input, a.min_len)
     else:
-        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
+        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short, a.input)
     if a.n_episodes is not None:
         data, kept = subsample_episodes(data, a.n_episodes, a.sample_seed)
         with open(a.output / "episodes.json", "w") as f:
             json.dump({"n_episodes": a.n_episodes, "sample_seed": a.sample_seed, "groups": kept}, f)
     if a.max_step is not None and a.drop_above_max:
-        keep = data["step_num"] <= a.max_step          # answer(-1)·prompt(0) 는 남는다
-        print(f"--drop-above-max: step>{a.max_step} 샘플 {int((~keep).sum())}개 제거")
+        keep = data["step_num"] <= a.max_step          # answer(-1)·prompt(0) ? ???
+        print(f"--drop-above-max: step>{a.max_step} ?? {int((~keep).sum())}? ??")
         data = _take(data, np.flatnonzero(keep))
     group, scale = not a.no_group_split, not a.no_scale
     if group and len(np.unique(data["group"])) < 2:
-        print("[warn] 그룹이 1개뿐 → 행 단위 split 으로 대체")
+        print("[warn] ??? 1?? ? ? ?? split ?? ??")
         group = False
 
     labels = sorted(np.unique(data["step_num"]).tolist())
     if a.max_step is not None:
         labels = [l for l in labels if l <= a.max_step]
-    # 보기 좋은 순서: prompt, step 1..N, answer
+    # ?? ?? ??: prompt, step 1..N, answer
     labels = ([PROMPT_LABEL] if PROMPT_LABEL in labels else []) \
              + [l for l in labels if l > 0] \
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
-    pcts = sorted(set(data["pct"].tolist()))                 # 평가를 나눌 % 지점 (하나뿐이면 전체와 같다)
+    pcts = sorted(set(data["pct"].tolist()))                 # ???? ?? % ?? (????? q ? ?? ??)
     if len(pcts) == 1:
         pcts = []
     print(f"targets={[target_name(l) for l in labels]} "
-          f"source={a.source} part={a.part} pct={a.pct} eval_pcts={pcts or '-'} group={group} scale={scale} "
-          f"cv={a.cv} offset={a.offset} device={a.device}")
+          f"source={a.source} input={a.input} part={a.part} pct={a.pct} eval_pcts={pcts or '-'} "
+          f"min_len={a.min_len} group={group} scale={scale} cv={a.cv} "
+          f"offset={a.offset} device={a.device}")
 
     if a.device == "cpu":
-        Xnp, gd = data["X"].float().numpy(), None            # float32 저장본이면 복사 없음
+        Xnp, gd = data["X"].float().numpy(), None            # float32 ????? ?? ??
     else:
         Xnp, gd = None, GpuData(data["X"], a.device)
         print(f"X on {a.device}: {tuple(gd.X.shape)} {str(gd.X.dtype).removeprefix('torch.')} "
@@ -546,12 +579,12 @@ def main():
         t = target_name(label)
         X, y, g = make_binary(data, label)
         if y.sum() < 2 or (1 - y).sum() < 2:
-            print(f"[skip] {t}: 샘플 부족")
+            print(f"[skip] {t}: ?? ??")
             continue
         for s in a.seeds:
             tr, te = split(len(y), y, g, a.test_size, s, group)
             if len(np.unique(y[te])) < 2:
-                print(f"[skip] {t} seed={s}: test 에 한 클래스만")
+                print(f"[skip] {t} seed={s}: test ? ? ????")
                 continue
             clf = fit(Xnp, gd, y, tr, s, a.cv, scale)
             m_tr, m_te = evaluate(clf, Xnp, gd, tr, y[tr]), evaluate(clf, Xnp, gd, te, y[te])
@@ -562,7 +595,7 @@ def main():
                              **{f"train_{k}": float(v) for k, v in m_tr.items()},
                              **{f"test_{k}": float(v) for k, v in m_te.items()}))
             per_pct = ""
-            for q in pcts:                                   # 같은 probe 를 test 의 q% 지점 행에만
+            for q in pcts:                                   # ?? probe ? test ? q% ???? ??
                 te_q = te[data["pct"][te] == q]
                 if len(te_q) == 0 or len(np.unique(y[te_q])) < 2:
                     continue
@@ -574,17 +607,18 @@ def main():
             with open(a.output / "classifiers" / f"{t}_seed{s}.pkl", "wb") as f:
                 pickle.dump(clf, f)
             print(f"{t:8s} seed={s:5d}  AUC={m_te['auc']:.3f} "
-                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f}" + (f"  | AUC by pct:{per_pct}" if per_pct else ""))
+                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f} margin={m_te['margin']:.3f}"
+                  + (f"  | AUC by pct:{per_pct}" if per_pct else ""))
 
     if not rows:
-        raise SystemExit("학습된 probe 가 없다")
+        raise SystemExit("??? probe ? ??")
 
     with open(a.output / "results_all.json", "w") as f:
         json.dump(rows, f, indent=2)
 
     def agg(r):
         return {k: dict(mean=float(np.mean([x[k] for x in r])), std=float(np.std([x[k] for x in r])))
-                for k in ("test_auc", "test_acc", "test_f1")}
+                for k in ("test_auc", "test_acc", "test_f1", "test_margin")}
 
     summary = {}
     for label in labels:
@@ -601,22 +635,22 @@ def main():
         json.dump(summary, f, indent=2)
 
     print("\n" + "-" * 62)
-    print(f"{'target':8s} {'AUC':>15s} {'Acc':>15s} {'F1':>15s}")
+    print(f"{'target':8s} {'AUC':>15s} {'Acc':>15s} {'F1':>15s} {'margin':>15s}")
     for t, s in summary.items():
         fmt = lambda k: f"{s[k]['mean']:.3f} ± {s[k]['std']:.3f}"
-        print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s}")
+        print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s} "
+              f"{fmt('test_margin'):>15s}")
     if pcts:
-        print("\nAUC by eval pct (학습은 전체 %, 평가는 그 % 지점만)")
-        print(f"{'target':8s}" + "".join(f"{q:>9d}%" for q in pcts))
-        for t, s in summary.items():
-            print(f"{t:8s}" + "".join(f"{s['by_pct'][str(q)]['test_auc']['mean']:10.3f}"
-                                       if str(q) in s.get("by_pct", {}) else f"{'-':>10s}" for q in pcts))
+        for met, lab in (("test_auc", "AUC"), ("test_margin", "margin")):
+            print(f"\n{lab} by eval pct (??? ?? %, ??? ? % ??)")
+            print(f"{'target':8s}" + "".join(f"{q:>9d}%" for q in pcts))
+            for t, s in summary.items():
+                print(f"{t:8s}" + "".join(f"{s['by_pct'][str(q)][met]['mean']:10.3f}"
+                                           if str(q) in s.get("by_pct", {}) else f"{'-':>10s}" for q in pcts))
 
     ts = list(summary)
-    src = {"hidden": f"hidden offset={a.offset}" + (f" pct={a.pct}" if a.pct else ""), "spectral": "spectral e_t",
-           "edges": f"spectral edges ({a.part})", "pct": f"spectral {a.pct}% cumulative"}[a.source]
     fig, ax = plt.subplots(figsize=(9, 5))
-    if pcts:                                                  # q 축 AUC 곡선, 타깃마다 선 하나
+    if pcts:                                                  # q ? AUC ??, ???? ? ??
         for t in ts:
             bp = summary[t].get("by_pct", {})
             qs = [q for q in pcts if str(q) in bp]
@@ -635,11 +669,14 @@ def main():
     ax.axhline(0.5, color="red", ls="--", lw=1, alpha=0.5)
     ax.set_ylim(0, 1.05)
     ax.legend()
+    vec = "hidden h" if a.input == "hidden" else "spectral e"
+    src = {"hidden": f"hidden offset={a.offset}" + (f" pct={a.pct}" if a.pct else ""), "spectral": "spectral e_t",
+           "edges": f"{vec} edges ({a.part})", "pct": f"{vec} @ {a.pct}%"}[a.source]
     ax.set_title(f"Last-layer probes: {src} (seeds={len(a.seeds)}, group={group})")
     fig.tight_layout()
     fig.savefig(a.output / "summary.png", dpi=150)
     plt.close(fig)
-    print(f"\nsaved → {a.output}")
+    print(f"\nsaved ? {a.output}")
 
 
 if __name__ == "__main__":
