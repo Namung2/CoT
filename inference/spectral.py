@@ -18,6 +18,11 @@ eigh 하고 σ_k v_k = Eᵀu_k 로 바꾼다. d=5120 ≫ n 이라 훨씬 싸고,
     --pct 10 20 40 … 100      구간 길이의 q% 까지 누적한 지점 (t = ⌈q·n/100⌉, 위치 t-1)  tag …_p10-20-40-…
                               짧은 구간에서 겹치는 지점은 하나로 합쳐지고, 100 은 구간 마지막 e_t 와 같다.
                               t < k 인 지점은 그람 rank 가 t 라 뒤쪽 고유성분이 0 이다 (그대로 저장, pos 로 구분).
+    --with-hidden             위 선택과 **같은 위치**의 hidden state 행 E[p] 도 레코드의 "h" 에 저장한다 (bf16 그대로).
+                              누적 gram e 는 토큰 0..p 전부가 필요해서 띄엄띄엄 저장한 E 로는 다시 못 만든다 —
+                              그래서 전체 E 가 손에 있는 이 단계에서 e 와 h 를 한 번에 뽑아 둔다. 전체 E 청크는
+                              건드리지 않는다 (이 스크립트는 입력을 절대 지우지 않는다). 읽는 쪽은
+                              predict/probing.py --source pct --input hidden.
 
     구간 t 의 토큰 0..n-1, marker = 구간 앞 형식 문구가 차지하는 토큰 수
         step 구간: 0 (헤더 줄은 입력에서 빠짐) / 터미널 구간: 정답 앞 문구 (extract.TERMINAL_PAT)
@@ -34,9 +39,10 @@ marker 는 n_front > 0 (그리고 --all 이 아님) 일 때만 필요하다. 원
 plan 0:9, predict 0:7). 어느 쪽인지는 에피소드마다 "marker_src" ("text" | "fixed" | "none") 에 남는다.
 
 출력: <out_dir>/<task>/<level>/<status>/<tag>/chunk_XXXX.pt,  tag = make_tag(...) 예: k8_scaled_sign-data_f0_b1
-    {"k", "scale", "sign_mode", "n_front", "n_back", "all", "pct", "dtype", "src", "model",
+    {"k", "scale", "sign_mode", "n_front", "n_back", "all", "pct", "dtype", "hidden", "src", "model",
      "episodes": {seed: {"seg": [...], "labels": [...], "marker": [m_0..m_N], "marker_src": str,
-                         "pos": {t: [p_1 < … < p_m]}, "e": {t: (m, kd)}, "lam": {t: (m, k)}}}}
+                         "pos": {t: [p_1 < … < p_m]}, "e": {t: (m, kd)}, "lam": {t: (m, k)},
+                         "h": {t: (m, d)}   # --with-hidden 일 때만, E 의 저장 dtype 그대로}}}
     t 는 extract.gen_view 구간 번호 (0..N-1 = Step 1..N, N = 터미널, 프롬프트 제외). pos 는 구간 안
     0-based 위치이고 e[t][i] 가 pos[t][i] 까지 누적한 e 다. 구간 마지막 e_t 는 e[t][-1] (segment_last 가
     꺼내 준다). 단위 고유벡터가 필요하면 CumulativeSpectral.eigvecs(e, lam) 으로 복원한다.
@@ -47,6 +53,8 @@ Usage:
     python inference/spectral.py --n-front 5 --n-back 5 -k 4 8 16 --sign-mode data max
     python inference/spectral.py --task decompose --all --dtype bfloat16
     python inference/spectral.py --n-front 5 --fallback-marker decompose=0:3 plan=0:9 predict=0:7
+    python inference/spectral.py --pct 1 5 10 20 50 80 90 95 99 100 --with-hidden --dtype bfloat16 \
+        --hidden-dir latent/hidden_states_marker --device cpu      # e + h, GPU 없이
 """
 from __future__ import annotations
 
@@ -151,8 +159,10 @@ class Select:
 ALL = Select(0, 0, True)
 
 
-def make_tag(k: int, scale: bool, sign_mode: str, select: Select = Select()) -> str:
-    """저장 디렉토리 이름. 예: k8_scaled_sign-data_f0_b1, k8_scaled_sign-data_all, k4_f5_b5.
+def make_tag(k: int, scale: bool, sign_mode: str, select: Select = Select(),
+             with_hidden: bool = False) -> str:
+    """저장 디렉토리 이름. 예: k8_scaled_sign-data_f0_b1, k8_scaled_sign-data_all, k4_f5_b5,
+    k8_scaled_sign-data_p1-5-…-100_h (with_hidden — e 와 같은 위치의 hidden 행 h 가 들어 있다).
 
     읽는 쪽(visual/heatmap.py, visual/step_similarity.py)도 이 함수를 써야 한다 —
     문자열을 손으로 베끼면 규칙이 바뀔 때 조용히 어긋난다."""
@@ -161,7 +171,7 @@ def make_tag(k: int, scale: bool, sign_mode: str, select: Select = Select()) -> 
     tag = f"k{k}" + ("_scaled" if scale else "")
     if sign_mode != "none":
         tag += f"_sign-{sign_mode}"
-    return f"{tag}_{select}"
+    return f"{tag}_{select}" + ("_h" if with_hidden else "")
 
 
 # ------------------------------------------------------------------ 부호 보정
@@ -463,12 +473,18 @@ def parse_fallback(items: list[str]) -> dict[str, tuple[int, int]]:
 
 @torch.no_grad()
 def episode_record(episode: dict, marks: list[int], cs: CumulativeSpectral, select: Select,
-                   marker_src: str, dtype: torch.dtype = torch.float32) -> dict:
-    """에피소드 하나 → 저장 레코드 (모듈 docstring 의 episodes[seed] 형식). e 만 dtype 으로, lam 은 float32."""
+                   marker_src: str, dtype: torch.dtype = torch.float32,
+                   with_hidden: bool = False) -> dict:
+    """에피소드 하나 → 저장 레코드 (모듈 docstring 의 episodes[seed] 형식). e 만 dtype 으로, lam 은 float32.
+
+    with_hidden=True 면 같은 위치의 hidden state 행 E[s+p] 를 rec["h"][t] 에 (m, d) 로 넣는다 — E 의
+    dtype 그대로 (bf16 저장본이면 bf16). e[t][i] 와 h[t][i] 는 같은 pos[t][i] 의 것이다."""
     E, seg = gen_view(episode)
-    k, kd = cs.k, cs.k * E.shape[1]
+    k, kd, d = cs.k, cs.k * E.shape[1], E.shape[1]
     rec = {"seg": seg, "labels": seg_labels(seg), "marker": marks, "marker_src": marker_src,
            "pos": {}, "e": {}, "lam": {}}
+    if with_hidden:
+        rec["h"] = {}
     for t, (s, e) in enumerate(zip(seg, seg[1:])):
         ps = select.positions(e - s, marks[t])
         cs.reset()
@@ -477,6 +493,9 @@ def episode_record(episode: dict, marks: list[int], cs: CumulativeSpectral, sele
         rec["pos"][t] = ps
         rec["e"][t] = torch.stack([r[0] for r in out]).to("cpu", dtype) if ps else torch.empty(0, kd, dtype=dtype)
         rec["lam"][t] = torch.stack([r[1] for r in out]).cpu() if ps else torch.empty(0, k)
+        if with_hidden:
+            idx = torch.as_tensor([s + p for p in ps], dtype=torch.long)
+            rec["h"][t] = E[idx] if ps else torch.empty(0, d, dtype=E.dtype)   # 인덱싱은 복사 — E 전체가 view 로 안 남는다
     return rec
 
 
@@ -509,13 +528,16 @@ def process_chunk(cf: Path, task: str, level: str, status: str, out_root: Path,
                   configs: list[Config], select: Select = Select(),
                   sources: dict | None = None, fallback: dict | None = None,
                   device: str | torch.device = DEVICE, dtype: torch.dtype = torch.float32,
-                  overwrite: bool = False, stats: Counter | None = None) -> Counter:
+                  overwrite: bool = False, stats: Counter | None = None,
+                  with_hidden: bool = False) -> Counter:
     """hidden_states 청크 하나를 읽어 configs 마다 저장 파일 하나씩 쓴다.
 
     청크를 한 번만 메모리에 올리고 marker 도 한 번만 세서 여러 (k, scale, sign_mode) 에 재사용한다.
-    overwrite=False 면 이미 있는 출력은 건너뛴다."""
+    overwrite=False 면 이미 있는 출력은 건너뛴다. 입력 청크(cf)는 읽기만 한다.
+    with_hidden=True 면 e 와 같은 위치의 hidden 행 h 도 넣고 태그에 _h 가 붙는다."""
     stats = Counter() if stats is None else stats
-    out_of = {c: out_root / task / level / status / make_tag(*c, select) / cf.name for c in configs}
+    out_of = {c: out_root / task / level / status / make_tag(*c, select, with_hidden) / cf.name
+              for c in configs}
     todo = [c for c in configs if overwrite or not out_of[c].exists()]
     if not todo:
         stats["chunk_skipped"] += 1
@@ -553,12 +575,12 @@ def process_chunk(cf: Path, task: str, level: str, status: str, out_root: Path,
         cs = CumulativeSpectral(k, scale, sm, device)
         eps = {}
         for seed, (marks, msrc) in marks_of.items():
-            eps[seed] = episode_record(d["episodes"][seed], marks, cs, select, msrc, dtype)
+            eps[seed] = episode_record(d["episodes"][seed], marks, cs, select, msrc, dtype, with_hidden)
         out = out_of[c]
         out.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"k": k, "scale": scale, "sign_mode": sm,
                     "n_front": select.n_front, "n_back": select.n_back, "all": select.all,
-                    "pct": list(select.pct),
+                    "pct": list(select.pct), "hidden": with_hidden,
                     "dtype": str(dtype).removeprefix("torch."),
                     "src": str(cf), "model": d.get("model", MODEL), "episodes": eps}, out)
         stats["files"] += 1
@@ -571,11 +593,13 @@ def spectral_run(hidden_dir: Path, out_root: Path, task: str, level: str, status
                  configs: list[Config], select: Select = Select(),
                  traj_dir: Path | None = None, mode: str = "no_thinking",
                  fallback: dict | None = None, device: str | torch.device = DEVICE,
-                 dtype: torch.dtype = torch.float32, overwrite: bool = False) -> Counter:
+                 dtype: torch.dtype = torch.float32, overwrite: bool = False,
+                 with_hidden: bool = False) -> Counter:
     """한 (task, level, status) 의 모든 청크를 configs 마다 저장한다. 반환: 집계 Counter.
 
     select.needs_marker 면 traj_dir 의 원본 jsonl 로 marker 를 센다 (없으면 fallback).
-    overwrite=True 면 출력 디렉토리의 낡은 chunk 파일도 지운다 (hidden_states 청크 수가 줄었을 때)."""
+    overwrite=True 면 **이 스크립트가 만든 출력 디렉토리**의 낡은 chunk 파일만 지운다
+    (hidden_states 청크 수가 줄었을 때). 입력 hidden_states 는 어떤 경우에도 건드리지 않는다."""
     hidden_dir = Path(hidden_dir).resolve()
     chunk_files = load_hidden_states(hidden_dir, task, level, status)
     sources = None
@@ -584,15 +608,15 @@ def spectral_run(hidden_dir: Path, out_root: Path, task: str, level: str, status
 
     if overwrite:
         for c in configs:
-            out_dir = out_root / task / level / status / make_tag(*c, select)
+            out_dir = out_root / task / level / status / make_tag(*c, select, with_hidden)
             for old in out_dir.glob("chunk_*.pt"):
                 old.unlink()
 
     stats = Counter()
-    desc = f"{task}/{level}/{status} {select} x{len(configs)}"
+    desc = f"{task}/{level}/{status} {select}{'+h' if with_hidden else ''} x{len(configs)}"
     for cf in tqdm(chunk_files, desc=desc, unit="chunk"):
         process_chunk(cf, task, level, status, out_root, configs, select,
-                      sources, fallback, device, dtype, overwrite, stats)
+                      sources, fallback, device, dtype, overwrite, stats, with_hidden)
     return stats
 
 
@@ -613,6 +637,9 @@ def main():
     ap.add_argument("--all", action="store_true", help="구간의 모든 토큰을 저장 (--n-front/--n-back 무시)")
     ap.add_argument("--pct", type=int, nargs="+", default=None, metavar="Q",
                     help="구간 길이의 Q%% 지점들만 저장 (예: 10 20 40 60 80 90 100; --n-front/--n-back 무시)")
+    ap.add_argument("--with-hidden", action="store_true",
+                    help="선택한 위치의 hidden state 행 E[p] 도 같이 저장 (\"h\"; 태그에 _h). "
+                         "probing.py --source pct/edges --input hidden 이 읽는다")
     ap.add_argument("--dtype", default="float32", choices=list(DTYPES), help="e 저장 dtype (lam 은 float32)")
     ap.add_argument("--hidden-dir", type=Path, default=ROOT / "latent" / "hidden_states")
     ap.add_argument("--traj-dir", type=Path, default=ROOT / "generation" / "trajectory",
@@ -639,7 +666,8 @@ def main():
                 if not (a.hidden_dir / task / level / status).is_dir():
                     continue
                 stats = spectral_run(a.hidden_dir, a.out_dir, task, level, status, configs, select,
-                                     a.traj_dir, a.mode, fallback, a.device, DTYPES[a.dtype], a.overwrite)
+                                     a.traj_dir, a.mode, fallback, a.device, DTYPES[a.dtype], a.overwrite,
+                                     a.with_hidden)
                 print(f"{task}/{level}/{status}: {dict(stats)}  ({time.time() - t0:.0f}s)")
                 total.update(stats)
     print(f"\ntotal: {dict(total)}")

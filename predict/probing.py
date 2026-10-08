@@ -40,6 +40,11 @@ boundaries 규약 (길이 N+3):
                  구간 길이의 Q% 지점까지 누적한 e 하나 (--pct Q 로 지점을 고른다, 구간마다 샘플 하나).
                  위치는 spectral.pct_position 으로 되찾는다. 100 은 [2] 의 e_t 와 같다.
                  t < k 인 지점(짧은 구간의 작은 Q) 도 거르지 않고 넣는다; 개수만 stats 의 t_lt_k 로 센다.
+                 --min-len L 을 주면 길이 L 미만 구간은 뺀다 (짧은 구간에서 여러 Q 가 같은 위치로 합쳐지는 것을 피할 때).
+    --input hidden|spectral  (edges / pct) 저장본의 어느 벡터를 쓸지. spectral(기본) = 누적 gram e (kd 차원),
+                 hidden = 같은 위치의 hidden state 행 h (d 차원; spectral.py --with-hidden 으로 저장한 _h 태그 파일만).
+                 같은 pos 에서 e 와 h 를 번갈아 돌리면 "임베딩 vs gram" 비교가 같은 샘플 집합 위에서 된다.
+    지표: acc / f1 / auc 에 더해 margin = 참 클래스 확률의 평균 (acc 가 1.0 에 붙어도 확신이 올라가는 정도를 본다).
     --max-step M 은 step M 까지만 probe 한다. --drop-above-max 를 같이 주면 그 뒤 step 은
     음성 샘플에서도 빠진다.
     분할은 어느 입력이든 에피소드 단위라 같은 에피소드의 샘플이 train/test 에 섞이지 않는다.
@@ -56,6 +61,10 @@ Usage:
         --output out/plan_goto --offset 1 --cv
     python probing.py --source pct --pct 40 \
         --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_p10-20-40-60-80-90-100/chunk_*.pt' --output out/pct_40
+    python probing.py --source pct --pct 5 --input hidden --min-len 20 \
+        --pt 'latent/spectral/decompose/BabyAI-GoToObj-v0/*/k8_scaled_sign-data_p1-5-10-20-50-80-90-95-99-100_h/chunk_*.pt' \
+        --output out/pct_h_05                       # 같은 저장본에서 --input spectral 로 바꾸면 gram 쪽
+    (모든 % 를 한 번에 돌려 곡선으로: script/pct_curve.py)
 """
 import sys
 import json
@@ -184,7 +193,16 @@ def load_spectral(patterns, k=None, sign_mode=None):
     return _pack(Xs, Ns, Gs, stats)
 
 
-def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
+def _vec_key(d, p, inp):
+    """저장본에서 읽을 키. hidden 이면 --with-hidden 으로 저장한 파일이어야 한다."""
+    if inp == "hidden":
+        if not d.get("hidden"):
+            raise SystemExit(f"{p}: hidden 행이 저장돼 있지 않다 (spectral.py --with-hidden 으로 만든 _h 태그 파일 필요)")
+        return "h"
+    return "e"
+
+
+def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False, inp="spectral"):
     """[3-5] edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
 
     part: both (3) | front (4) | back (5). e_i 하나하나가 샘플이고 라벨은 그 구간.
@@ -204,6 +222,7 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
         n_front, n_back, is_all = d["n_front"], d["n_back"], d.get("all", False)
         if is_all and part != "both":
             raise SystemExit(f"--all 로 저장한 파일은 --part both 만 가능 ({p})")
+        key = _vec_key(d, p, inp)
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "edges", seed)
             n_seg = len(ep["e"])
@@ -216,7 +235,7 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
                     stats[f"short_{target_name(_seg_label(t, n_seg))}"] += 1
                     if not keep_short:
                         continue
-                for pos, row in zip(ep["pos"][t], ep["e"][t]):
+                for pos, row in zip(ep["pos"][t], ep[key][t]):
                     if part == "front" and not (m <= pos < m + n_front):
                         continue
                     if part == "back" and pos < n - n_back:
@@ -225,12 +244,14 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
     return _pack(Xs, Ns, Gs, stats)
 
 
-def load_pct(patterns, pct, k=None, sign_mode=None):
-    """[6] pct: 구간 길이의 pct% 지점까지 누적한 e (구간마다 하나). --pct 로 저장한 파일만 읽는다.
+def load_pct(patterns, pct, k=None, sign_mode=None, inp="spectral", min_len=0):
+    """[6] pct: 구간 길이의 pct% 지점까지 누적한 e (또는 같은 위치의 hidden 행 h; inp) — 구간마다 하나.
+    --pct 로 저장한 파일만 읽는다.
 
-    저장본은 pos 와 e 만 갖고 있으므로 pct_position(pct, n) 으로 위치를 되찾아 그 행을 꺼낸다.
-    짧은 구간에서 여러 % 가 같은 위치로 합쳐져도 위치는 반드시 있다. 거르지 않는다 —
-    t < k 인 지점(그람 rank 부족) 개수만 t_lt_k 로 센다."""
+    저장본은 pos 와 e/h 만 갖고 있으므로 pct_position(pct, n) 으로 위치를 되찾아 그 행을 꺼낸다.
+    짧은 구간에서 여러 % 가 같은 위치로 합쳐져도 위치는 반드시 있다. 기본은 거르지 않는다 —
+    t < k 인 지점(그람 rank 부족) 개수만 t_lt_k 로 센다. min_len > 0 이면 그보다 짧은 구간은 뺀다
+    (short_segment 로 센다) — 양성·음성 어느 쪽으로도 안 쓴다."""
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
     for p in _paths(patterns):
@@ -239,6 +260,7 @@ def load_pct(patterns, pct, k=None, sign_mode=None):
             continue
         if pct not in d.get("pct", []):
             raise SystemExit(f"{p}: {pct}% 지점이 저장돼 있지 않다 (저장된 pct={d.get('pct')})")
+        key = _vec_key(d, p, inp)
         k_eig = d["k"]
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "edges", seed)                      # spectral/edges 와 같은 경로 규칙
@@ -246,6 +268,9 @@ def load_pct(patterns, pct, k=None, sign_mode=None):
             stats["episodes"] += 1
             for t in range(n_seg):
                 n = seg[t + 1] - seg[t]
+                if n < min_len:
+                    stats["short_segment"] += 1
+                    continue
                 want = pct_position(pct, n)
                 ps = ep["pos"][t]
                 if want not in ps:
@@ -253,7 +278,7 @@ def load_pct(patterns, pct, k=None, sign_mode=None):
                     continue
                 if want + 1 < k_eig:
                     stats["t_lt_k"] += 1
-                Xs.append(ep["e"][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                Xs.append(ep[key][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
@@ -426,10 +451,12 @@ def fit(Xnp, gd, y, idx, seed, cv, scale):
 
 
 def evaluate(clf, Xnp, gd, idx, y):
+    """acc / f1 / auc + margin. margin = 참 클래스에 준 확률의 평균 (y=1 이면 p, y=0 이면 1-p):
+    0.5 = 찍기, 1.0 = 완전 확신. acc 가 포화돼도 위치에 따라 올라가는 정도가 보인다."""
     p = clf.predict_proba(gd, idx)[:, 1] if gd is not None else clf.predict_proba(Xnp[idx])[:, 1]
     yhat = (p > 0.5).astype(int)
     return dict(acc=accuracy_score(y, yhat), f1=f1_score(y, yhat, zero_division=0),
-                auc=roc_auc_score(y, p))
+                auc=roc_auc_score(y, p), margin=float(np.mean(np.where(y == 1, p, 1 - p))))
 
 
 # ---------------------------------------------------------------- main
@@ -450,6 +477,11 @@ def main():
                     help="spectral/edges: 이 부호 규칙인 파일만 쓴다")
     ap.add_argument("--keep-short", action="store_true",
                     help="edges: marker+앞+뒤 보다 짧은 구간도 넣는다 (기본은 제외)")
+    ap.add_argument("--input", choices=("spectral", "hidden"), default="spectral",
+                    help="edges/pct 저장본에서 누적 gram e(spectral) 를 쓸지, 같은 위치의 hidden 행 h 를 쓸지 "
+                         "(h 는 spectral.py --with-hidden 으로 저장한 _h 파일에만 있다)")
+    ap.add_argument("--min-len", type=int, default=0,
+                    help="pct: 이 길이(토큰) 미만 구간은 샘플에서 뺀다 (여러 %% 가 한 위치로 합쳐지는 짧은 구간 제외)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--offset", type=int, default=0,
                     help="구간 마지막 토큰에서 몇 칸 앞을 대표로 쓸지 (ablation)")
@@ -482,9 +514,9 @@ def main():
     elif a.source == "pct":
         if a.pct is None:
             raise SystemExit("--source pct 는 --pct Q 가 필요하다")
-        data = load_pct(a.pt, a.pct, a.k, a.sign_mode)
+        data = load_pct(a.pt, a.pct, a.k, a.sign_mode, a.input, a.min_len)
     else:
-        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
+        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short, a.input)
     if a.n_episodes is not None:
         data, kept = subsample_episodes(data, a.n_episodes, a.sample_seed)
         with open(a.output / "episodes.json", "w") as f:
@@ -507,7 +539,8 @@ def main():
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
     print(f"targets={[target_name(l) for l in labels]} "
-          f"source={a.source} part={a.part} pct={a.pct} group={group} scale={scale} cv={a.cv} "
+          f"source={a.source} input={a.input} part={a.part} pct={a.pct} min_len={a.min_len} "
+          f"group={group} scale={scale} cv={a.cv} "
           f"offset={a.offset} device={a.device}")
 
     if a.device == "cpu":
@@ -540,7 +573,7 @@ def main():
             with open(a.output / "classifiers" / f"{t}_seed{s}.pkl", "wb") as f:
                 pickle.dump(clf, f)
             print(f"{t:8s} seed={s:5d}  AUC={m_te['auc']:.3f} "
-                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f}")
+                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f} margin={m_te['margin']:.3f}")
 
     if not rows:
         raise SystemExit("학습된 probe 가 없다")
@@ -555,16 +588,17 @@ def main():
         if r:
             summary[t] = {k: dict(mean=float(np.mean([x[k] for x in r])),
                                   std=float(np.std([x[k] for x in r])))
-                          for k in ("test_auc", "test_acc", "test_f1")}
+                          for k in ("test_auc", "test_acc", "test_f1", "test_margin")}
             summary[t]["n_seeds"] = len(r)
     with open(a.output / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print("\n" + "-" * 62)
-    print(f"{'target':8s} {'AUC':>15s} {'Acc':>15s} {'F1':>15s}")
+    print(f"{'target':8s} {'AUC':>15s} {'Acc':>15s} {'F1':>15s} {'margin':>15s}")
     for t, s in summary.items():
         fmt = lambda k: f"{s[k]['mean']:.3f} ± {s[k]['std']:.3f}"
-        print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s}")
+        print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s} "
+              f"{fmt('test_margin'):>15s}")
 
     ts = list(summary)
     x, w = np.arange(len(ts)), 0.25
@@ -577,8 +611,9 @@ def main():
     ax.set_xticklabels(ts)
     ax.set_ylim(0, 1.05)
     ax.legend()
+    vec = "hidden h" if a.input == "hidden" else "spectral e"
     src = {"hidden": f"hidden offset={a.offset}", "spectral": "spectral e_t",
-           "edges": f"spectral edges ({a.part})", "pct": f"spectral {a.pct}% cumulative"}[a.source]
+           "edges": f"{vec} edges ({a.part})", "pct": f"{vec} @ {a.pct}%"}[a.source]
     ax.set_title(f"Last-layer probes: {src} (seeds={len(a.seeds)}, group={group})")
     fig.tight_layout()
     fig.savefig(a.output / "summary.png", dpi=150)
