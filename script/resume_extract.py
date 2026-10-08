@@ -78,7 +78,7 @@ def main():
             return
         out = run_dir / status / f"chunk_{next_idx[status]:04d}.pt"
         torch.save({"episodes": buffers[status], **chunk_header()}, out)
-        print(f"  wrote {out.relative_to(ROOT)} ({len(buffers[status])} episodes)")
+        print(f"  wrote {out} ({len(buffers[status])} episodes)")   # --hidden-dir 가 상대경로여도 되게 relative_to 안 씀
         buffers[status] = {}
         next_idx[status] += 1
 

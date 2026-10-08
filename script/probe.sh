@@ -6,6 +6,9 @@
 #     latent/spectral/<task>/<level>/{success,failure}/k8_scaled_sign-<mode>_f5_b5/chunk_*.pt
 # SOURCE=pct PCT=40 TAG_SUFFIX=_p10-20-40-60-80-90-100 SPECTRAL_DIR=latent/spectral: 구간 40% 지점 누적 e.
 #     → out/probe_pct_40/
+# SOURCE=hidden HIDDEN_DIR=latent/hidden_states_marker PCTS="10 20 40 60 80 90 100": 토큰 hidden state 자체.
+#     구간의 q% 지점 토큰을 q 마다 샘플로 넣어 학습하고 평가는 q 별로 나눈다 (probing.py --pct). sign_mode 는 무관해서
+#     런 이름은 <task>_<level>_hidden. PCTS 를 비우면 구간 마지막 토큰만. → out/probe_hidden_pct/
 # 레벨마다 에피소드 N_EPISODES 개만 쓴다 (success 우선, 모자라면 failure). 같은 SAMPLE_SEED 라
 # max / data 가 같은 에피소드 집합 위에서 비교된다.
 # 런들은 DEVICES 의 GPU 에 라운드로빈으로 배정되어 GPU 마다 하나씩 동시에 돈다 (probing.py --device).
@@ -17,6 +20,7 @@
 #   DEVICES="cpu" ./script/probe.sh              # sklearn CPU 경로 (느림)
 #   SOURCE=edges PART=front TAG_SUFFIX=_f5_b5 SPECTRAL_DIR=latent/spectral SIGN_MODES=data ./script/probe.sh
 #   SOURCE=pct PCT=40 TAG_SUFFIX=_p10-20-40-60-80-90-100 SPECTRAL_DIR=latent/spectral SIGN_MODES=data ./script/probe.sh
+#   SOURCE=hidden HIDDEN_DIR=latent/hidden_states_marker TASK_LEVELS="decompose:BabyAI-GoToObj-v0" ./script/probe.sh
 #   SIGN_MODES="max" TASK_LEVELS="plan:CustomBabyAI-GoToRedBall-Small-4Dists-v0" ./script/probe.sh
 #   tail -f nohup_probe_*.out
 set -uo pipefail
@@ -32,15 +36,20 @@ if [[ "${PROBE_SH_BG:-}" != "1" && "${NO_BG:-}" != "1" ]]; then
     exit 0
 fi
 
-SOURCE="${SOURCE:-spectral}"                 # spectral | edges | pct
+SOURCE="${SOURCE:-spectral}"                 # spectral | edges | pct | hidden
 PART="${PART:-both}"                         # edges 일 때: both | front | back
 PCT="${PCT:-100}"                            # pct 일 때: 저장본의 --pct 목록 중 하나
+HIDDEN_DIR="${HIDDEN_DIR:-latent/hidden_states_marker}"   # hidden 일 때
+PCTS="${PCTS:-10 20 40 60 80 90 100}"                      # hidden 일 때 학습/평가 % 지점 (빈 문자열 = 마지막 토큰만)
 TAG_SUFFIX="${TAG_SUFFIX:-}"                 # 새 포맷이면 _f5_b5 처럼 (옛 spectral_states 는 빈 문자열)
 SPECTRAL_DIR="${SPECTRAL_DIR:-latent/spectral_states}"
 if [[ "$SOURCE" == "edges" ]]; then
     OUT_ROOT="${OUT_ROOT:-out/probe_edges_${PART}}"
 elif [[ "$SOURCE" == "pct" ]]; then
     OUT_ROOT="${OUT_ROOT:-out/probe_pct_${PCT}}"
+elif [[ "$SOURCE" == "hidden" ]]; then
+    OUT_ROOT="${OUT_ROOT:-out/probe_hidden_pct}"
+    SIGN_MODES="hidden"                      # sign_mode 는 쓰지 않는다; 런 이름 접미사로만
 else
     OUT_ROOT="${OUT_ROOT:-out/probe_spectral}"
 fi
@@ -84,6 +93,7 @@ echo "runs=${#JOBS[@]} devices=${DEVS[*]} seeds=[$SEEDS] n_episodes=$N_EPISODES 
 PART_ARGS=()
 [[ "$SOURCE" == "edges" ]] && PART_ARGS=(--part "$PART")
 [[ "$SOURCE" == "pct" ]] && PART_ARGS=(--pct "$PCT")
+[[ "$SOURCE" == "hidden" && -n "$PCTS" ]] && PART_ARGS=(--pct $PCTS)
 
 run_one() {                       # run_one <device> <task> <level> <sign_mode>
     local dev="$1" task="$2" level="$3" sm="$4"
@@ -95,9 +105,9 @@ run_one() {                       # run_one <device> <task> <level> <sign_mode>
     fi
     local t0=$(date +%s)
     echo "[$dev] start $name $(date '+%T')"
-    python predict/probing.py --source "$SOURCE" "${PART_ARGS[@]}" \
-        --pt "$SPECTRAL_DIR/$task/$level/*/$tag/chunk_*.pt" \
-        --k "$K" --sign-mode "$sm" \
+    local pt_args=(--pt "$SPECTRAL_DIR/$task/$level/*/$tag/chunk_*.pt" --k "$K" --sign-mode "$sm")
+    [[ "$SOURCE" == "hidden" ]] && pt_args=(--pt "$HIDDEN_DIR/$task/$level/*/chunk_*.pt")
+    python predict/probing.py --source "$SOURCE" "${PART_ARGS[@]}" "${pt_args[@]}" \
         --n-episodes "$N_EPISODES" --sample-seed "$SAMPLE_SEED" \
         --max-step "${MAX_STEP[$task]}" --seeds $SEEDS --device "$dev" \
         --output "$OUT_ROOT/$name" > "$LOG_DIR/${name}.log" 2>&1

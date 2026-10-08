@@ -25,6 +25,11 @@ boundaries 규약 (길이 N+3):
 
 입력 종류 (--source). 라벨은 모두 같다: 해당 구간이면 참, 다른 구간이면 거짓.
     hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
+                 --pct 10 20 … 100 을 주면 구간마다 q% 지점 토큰 E[s + pct_position(q, n)] 을 q 마다 하나씩
+                 샘플로 넣는다 (누적 없음, 그 위치의 마지막 레이어 벡터 그대로; 100 = 구간 마지막 토큰).
+                 학습은 모든 q 를 섞어 probe 하나를 만들고, 평가는 test 에피소드에서 q 마다 따로 잰다
+                 (summary.json 의 by_pct, summary.png 는 q 축 AUC 곡선). 짧은 구간에서 여러 q 가 같은
+                 토큰을 가리켜도 q 마다 행을 따로 둔다. --offset 은 --pct 와 같이 못 쓴다.
     spectral [2] latent/spectral 저장본의 구간 마지막 e_t (e[t][-1], 구간마다 kd 벡터 하나).
                  n_back ≥ 1 이거나 --all 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
                  옛 latent/spectral_states 포맷 (e[t] 가 (kd,) 하나, seg/pos 없음) 도 그대로 읽는다.
@@ -56,6 +61,8 @@ Usage:
         --output out/plan_goto --offset 1 --cv
     python probing.py --source pct --pct 40 \
         --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_p10-20-40-60-80-90-100/chunk_*.pt' --output out/pct_40
+    python probing.py --pt 'latent/hidden_states_marker/decompose/BabyAI-GoToObj-v0/*/chunk_*.pt' \
+        --pct 10 20 40 60 80 90 100 --output out/hidden_pct_gotoobj          # 학습 전체, 평가 q 별
 """
 import sys
 import json
@@ -102,10 +109,13 @@ def _gid(p: Path, source: str, seed) -> str:
     return f"{task}/{level}/{status}/{seed}"
 
 
-def load_pt(patterns, offset, with_prompt=False):
-    """[1] hidden_states: 구간 마지막 토큰 E[end-1-offset] 하나."""
-    Xs, Ns, Gs = [], [], []
+def load_pt(patterns, offset, with_prompt=False, pct=None):
+    """[1] hidden_states: 구간 마지막 토큰 E[end-1-offset] 하나.
+    pct 가 있으면 구간마다 q% 지점 토큰을 q 마다 하나씩 (offset 은 0 이어야 한다). 행마다 q 를 Ps 에 남긴다."""
+    Xs, Ns, Gs, Ps = [], [], [], []
     stats = Counter()
+    if pct and offset:
+        raise SystemExit("--pct 와 --offset 은 같이 못 쓴다")
 
     for p in _paths(patterns):
         d = torch.load(p, map_location="cpu", weights_only=False)
@@ -126,19 +136,25 @@ def load_pt(patterns, offset, with_prompt=False):
             stats["episodes"] += 1
 
             def take(start, end, label):
+                if pct:                                       # q% 지점 토큰, q 마다 한 행
+                    for q in pct:
+                        i = start + pct_position(q, end - start)
+                        Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(q)
+                    return
                 i = end - 1 - offset
                 if i < start:
                     stats["segment_too_short"] += 1
                     return
-                Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid)  # view 면 E 전체가 살아남아 300GB 까지 감
+                Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(100)  # view 면 E 전체가 살아남아 300GB 까지 감
 
-            if with_prompt:
-                take(b[0], b[1], PROMPT_LABEL)
+            if with_prompt:                                   # 프롬프트는 항상 마지막 토큰 하나
+                i = b[1] - 1 - offset
+                Xs.append(E[i].clone()); Ns.append(PROMPT_LABEL); Gs.append(gid); Ps.append(100)
             for k, (s, e) in enumerate(zip(b[1:-2], b[2:-1]), start=1):   # step 1..N
                 take(s, e, k)
             take(b[-2], b[-1], ANSWER_LABEL)                              # 터미널
 
-    return _pack(Xs, Ns, Gs, stats)
+    return _pack(Xs, Ns, Gs, stats, Ps)
 
 
 def _seg_label(t: int, n_seg: int) -> int:
@@ -254,20 +270,23 @@ def load_pct(patterns, pct, k=None, sign_mode=None):
                 if want + 1 < k_eig:
                     stats["t_lt_k"] += 1
                 Xs.append(ep["e"][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
-    return _pack(Xs, Ns, Gs, stats)
+    return _pack(Xs, Ns, Gs, stats, pct_value=pct)
 
 
-def _pack(Xs, Ns, Gs, stats):
+def _pack(Xs, Ns, Gs, stats, Ps=None, pct_value=100):
     """행 목록 → data. X 는 torch 텐서로, 저장 dtype 그대로 둔다 (bf16 저장본이면 bf16 — fp32 로 바꾸면
-    edges 는 수십 GB 가 두 배가 된다). CPU(sklearn) 경로는 main 에서 한 번 float32 numpy 로 바꾼다."""
+    edges 는 수십 GB 가 두 배가 된다). CPU(sklearn) 경로는 main 에서 한 번 float32 numpy 로 바꾼다.
+    pct: 행마다 "구간의 몇 % 지점인가" (Ps 가 없으면 전부 pct_value). 평가를 % 별로 나눌 때 쓴다."""
     if not Xs:
         raise SystemExit("벡터 없음 — 입력 경로/규약 확인")
     X = torch.stack(Xs)
     Xs.clear()
-    data = dict(X=X, step_num=np.array(Ns, np.int32), group=np.array(Gs, dtype=object))
+    P = np.array(Ps if Ps is not None else [pct_value] * len(Ns), np.int32)
+    data = dict(X=X, step_num=np.array(Ns, np.int32), group=np.array(Gs, dtype=object), pct=P)
     print(f"loaded: {dict(stats)}")
     print(f"  X={tuple(X.shape)} {str(X.dtype).removeprefix('torch.')}  "
-          f"구간별 개수={dict(sorted(Counter(Ns).items()))}  groups={len(set(Gs))}")
+          f"구간별 개수={dict(sorted(Counter(Ns).items()))}  groups={len(set(Gs))}"
+          + (f"  pct별 개수={dict(sorted(Counter(P.tolist()).items()))}" if len(set(P.tolist())) > 1 else ""))
     return data
 
 
@@ -440,8 +459,9 @@ def main():
     ap.add_argument("--source", choices=SOURCES, default="hidden",
                     help="hidden: 구간 마지막 토큰 hidden (1) | spectral: 구간 전체 누적 e_t (2) | "
                          "edges: 구간 앞/뒤 토큰별 누적 e_i (3-5, --part) | pct: 구간 Q%% 지점 누적 e (6, --pct)")
-    ap.add_argument("--pct", type=int, default=None, metavar="Q",
-                    help="--source pct 일 때: 구간 길이의 Q%% 지점 (저장본의 --pct 목록 중 하나, 100 = 구간 끝)")
+    ap.add_argument("--pct", type=int, nargs="+", default=None, metavar="Q",
+                    help="hidden: 구간 길이의 Q%% 지점 토큰들 (여러 개; 학습은 전부 섞고 평가는 Q 별) | "
+                         "pct 소스: 저장본의 --pct 목록 중 하나 (100 = 구간 끝)")
     ap.add_argument("--part", choices=("both", "front", "back"), default="both",
                     help="--source edges 일 때: both=앞5+뒤5 (3), front=헤더 뺀 앞5 (4), back=뒤5 (5)")
     ap.add_argument("--k", type=int, default=None,
@@ -476,13 +496,14 @@ def main():
     (a.output / "classifiers").mkdir(exist_ok=True)
 
     if a.source == "hidden":
-        data = load_pt(a.pt, a.offset, a.with_prompt)
+        pct = sorted(set(a.pct)) if a.pct else None
+        data = load_pt(a.pt, a.offset, a.with_prompt, pct)
     elif a.source == "spectral":
         data = load_spectral(a.pt, a.k, a.sign_mode)
     elif a.source == "pct":
-        if a.pct is None:
-            raise SystemExit("--source pct 는 --pct Q 가 필요하다")
-        data = load_pct(a.pt, a.pct, a.k, a.sign_mode)
+        if a.pct is None or len(a.pct) != 1:
+            raise SystemExit("--source pct 는 --pct Q 하나가 필요하다")
+        data = load_pct(a.pt, a.pct[0], a.k, a.sign_mode)
     else:
         data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
     if a.n_episodes is not None:
@@ -506,9 +527,12 @@ def main():
              + [l for l in labels if l > 0] \
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
+    pcts = sorted(set(data["pct"].tolist()))                 # 평가를 나눌 % 지점 (하나뿐이면 전체와 같다)
+    if len(pcts) == 1:
+        pcts = []
     print(f"targets={[target_name(l) for l in labels]} "
-          f"source={a.source} part={a.part} pct={a.pct} group={group} scale={scale} cv={a.cv} "
-          f"offset={a.offset} device={a.device}")
+          f"source={a.source} part={a.part} pct={a.pct} eval_pcts={pcts or '-'} group={group} scale={scale} "
+          f"cv={a.cv} offset={a.offset} device={a.device}")
 
     if a.device == "cpu":
         Xnp, gd = data["X"].float().numpy(), None            # float32 저장본이면 복사 없음
@@ -532,15 +556,25 @@ def main():
             clf = fit(Xnp, gd, y, tr, s, a.cv, scale)
             m_tr, m_te = evaluate(clf, Xnp, gd, tr, y[tr]), evaluate(clf, Xnp, gd, te, y[te])
             lr = clf if isinstance(clf, TorchLogReg) else clf[-1]
-            rows.append(dict(target=t, seed=s, n_train=int(len(tr)), n_test=int(len(te)),
-                             n_pos_test=int(y[te].sum()),
-                             C=float(np.atleast_1d(getattr(lr, "C_", lr.C))[0]),
+            C = float(np.atleast_1d(getattr(lr, "C_", lr.C))[0])
+            rows.append(dict(target=t, seed=s, eval_pct="all", n_train=int(len(tr)), n_test=int(len(te)),
+                             n_pos_test=int(y[te].sum()), C=C,
                              **{f"train_{k}": float(v) for k, v in m_tr.items()},
                              **{f"test_{k}": float(v) for k, v in m_te.items()}))
+            per_pct = ""
+            for q in pcts:                                   # 같은 probe 를 test 의 q% 지점 행에만
+                te_q = te[data["pct"][te] == q]
+                if len(te_q) == 0 or len(np.unique(y[te_q])) < 2:
+                    continue
+                m_q = evaluate(clf, Xnp, gd, te_q, y[te_q])
+                rows.append(dict(target=t, seed=s, eval_pct=int(q), n_train=int(len(tr)), n_test=int(len(te_q)),
+                                 n_pos_test=int(y[te_q].sum()), C=C,
+                                 **{f"test_{k}": float(v) for k, v in m_q.items()}))
+                per_pct += f" {q}%={m_q['auc']:.3f}"
             with open(a.output / "classifiers" / f"{t}_seed{s}.pkl", "wb") as f:
                 pickle.dump(clf, f)
             print(f"{t:8s} seed={s:5d}  AUC={m_te['auc']:.3f} "
-                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f}")
+                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f}" + (f"  | AUC by pct:{per_pct}" if per_pct else ""))
 
     if not rows:
         raise SystemExit("학습된 probe 가 없다")
@@ -548,15 +582,21 @@ def main():
     with open(a.output / "results_all.json", "w") as f:
         json.dump(rows, f, indent=2)
 
+    def agg(r):
+        return {k: dict(mean=float(np.mean([x[k] for x in r])), std=float(np.std([x[k] for x in r])))
+                for k in ("test_auc", "test_acc", "test_f1")}
+
     summary = {}
     for label in labels:
         t = target_name(label)
-        r = [x for x in rows if x["target"] == t]
-        if r:
-            summary[t] = {k: dict(mean=float(np.mean([x[k] for x in r])),
-                                  std=float(np.std([x[k] for x in r])))
-                          for k in ("test_auc", "test_acc", "test_f1")}
-            summary[t]["n_seeds"] = len(r)
+        r = [x for x in rows if x["target"] == t and x["eval_pct"] == "all"]
+        if not r:
+            continue
+        summary[t] = agg(r)
+        summary[t]["n_seeds"] = len(r)
+        if pcts:
+            summary[t]["by_pct"] = {str(q): agg(rq) for q in pcts
+                                    if (rq := [x for x in rows if x["target"] == t and x["eval_pct"] == q])}
     with open(a.output / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -565,20 +605,36 @@ def main():
     for t, s in summary.items():
         fmt = lambda k: f"{s[k]['mean']:.3f} ± {s[k]['std']:.3f}"
         print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s}")
+    if pcts:
+        print("\nAUC by eval pct (학습은 전체 %, 평가는 그 % 지점만)")
+        print(f"{'target':8s}" + "".join(f"{q:>9d}%" for q in pcts))
+        for t, s in summary.items():
+            print(f"{t:8s}" + "".join(f"{s['by_pct'][str(q)]['test_auc']['mean']:10.3f}"
+                                       if str(q) in s.get("by_pct", {}) else f"{'-':>10s}" for q in pcts))
 
     ts = list(summary)
-    x, w = np.arange(len(ts)), 0.25
+    src = {"hidden": f"hidden offset={a.offset}" + (f" pct={a.pct}" if a.pct else ""), "spectral": "spectral e_t",
+           "edges": f"spectral edges ({a.part})", "pct": f"spectral {a.pct}% cumulative"}[a.source]
     fig, ax = plt.subplots(figsize=(9, 5))
-    for i, (k, lab) in enumerate([("test_auc", "AUC"), ("test_acc", "Acc"), ("test_f1", "F1")]):
-        ax.bar(x + (i - 1) * w, [summary[t][k]["mean"] for t in ts], w,
-               yerr=[summary[t][k]["std"] for t in ts], capsize=3, label=lab)
+    if pcts:                                                  # q 축 AUC 곡선, 타깃마다 선 하나
+        for t in ts:
+            bp = summary[t].get("by_pct", {})
+            qs = [q for q in pcts if str(q) in bp]
+            ax.errorbar(qs, [bp[str(q)]["test_auc"]["mean"] for q in qs],
+                        yerr=[bp[str(q)]["test_auc"]["std"] for q in qs], marker="o", capsize=3, label=t)
+        ax.set_xlabel("eval position in segment (%)")
+        ax.set_ylabel("test AUC")
+        ax.set_xticks(pcts)
+    else:
+        x, w = np.arange(len(ts)), 0.25
+        for i, (k, lab) in enumerate([("test_auc", "AUC"), ("test_acc", "Acc"), ("test_f1", "F1")]):
+            ax.bar(x + (i - 1) * w, [summary[t][k]["mean"] for t in ts], w,
+                   yerr=[summary[t][k]["std"] for t in ts], capsize=3, label=lab)
+        ax.set_xticks(x)
+        ax.set_xticklabels(ts)
     ax.axhline(0.5, color="red", ls="--", lw=1, alpha=0.5)
-    ax.set_xticks(x)
-    ax.set_xticklabels(ts)
     ax.set_ylim(0, 1.05)
     ax.legend()
-    src = {"hidden": f"hidden offset={a.offset}", "spectral": "spectral e_t",
-           "edges": f"spectral edges ({a.part})", "pct": f"spectral {a.pct}% cumulative"}[a.source]
     ax.set_title(f"Last-layer probes: {src} (seeds={len(a.seeds)}, group={group})")
     fig.tight_layout()
     fig.savefig(a.output / "summary.png", dpi=150)
