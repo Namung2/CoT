@@ -1,60 +1,43 @@
 #!/usr/bin/env python
-"""chunk_*.pt ? ?? ?? step-wise one-vs-rest ?? probe ?? (??? ???).
+"""chunk_*.pt 를 직접 읽어 step-wise one-vs-rest 선형 probe 학습 (마지막 레이어).
 
-.pt ?? (extract.py ??):
+.pt 형식 (extract.py 출력):
     {"model": ..., "boundary_layout": "prompt|steps|terminal", "label_priority": ...,
      "episodes": {env_seed: {"E": bf16[n_tok, D],
                              "boundaries": [0, b_prompt, b_step1, ..., b_stepN, n_tok],
                              "output_sha1": str}}}
 
-boundaries ?? (?? N+3):
-    ?? = [????][step 1]...[step N][???]
-    b[0]=0, b[1]=???? ?, b[1+k]=step k ?, b[-2]=step N ?(=??? ??), b[-1]=?? ?
+boundaries 규약 (길이 N+3):
+    구간 = [프롬프트][step 1]...[step N][터미널]
+    b[0]=0, b[1]=프롬프트 끝, b[1+k]=step k 끝, b[-2]=step N 끝(=터미널 시작), b[-1]=전체 끝
 
-??: <hidden_root>/<task>/<level>/<status>/chunk_*.pt
-    ? group id = "<task>/<level>/<status>/<seed>"  (?? level ? ?? task ? ????
-      task ?? ??? glob ? ??? ? ???? ???)
+경로: <hidden_root>/<task>/<level>/<status>/chunk_*.pt
+    → group id = "<task>/<level>/<status>/<seed>"  (같은 level 이 여러 task 에 있으므로
+      task 까지 넣어야 glob 을 섞었을 때 충돌하지 않는다)
 
-?? ??: ??? ??? ?? E[end-1-offset].
-    step k ? ??? ?? = "Step k+1" ?? ?? ??. ??(Sun et al.)? ?? ???
-    "Step k+1 activation" ?? ??? ? ???? ?? ???? step_k ? ???.
-    ??? ??? ??? ??? "answer" ???.
+대표 벡터: 구간의 마지막 토큰 E[end-1-offset].
+    step k 의 마지막 토큰 = "Step k+1" 마커 직전 토큰. 논문(Sun et al.)은 같은 벡터를
+    "Step k+1 activation" 이라 부른다 — 여기서는 구간 기준으로 step_k 라 부른다.
+    터미널 구간의 마지막 토큰은 "answer" 클래스.
 
-    --with-prompt ? ?? ???? ??? ??? ??? "prompt" ???? ???.
-    (??? "Step 1" ? ? ??. ?? ???? ??? ?? ?? ????? ??? ??)
+    --with-prompt 를 주면 프롬프트 구간의 마지막 토큰도 "prompt" 클래스로 넣는다.
+    (논문의 "Step 1" 이 이 자리. 토큰 종류부터 달라서 거의 항상 분리되므로 기본은 제외)
 
-?? ?? (--source). ??? ?? ??: ?? ???? ?, ?? ???? ??.
-    hidden   [1] hidden_states ? ?? ??? ?? (? ??)
-                 --pct 10 20 ? 100 ? ?? ???? q% ?? ?? E[s + pct_position(q, n)] ? q ?? ???
-                 ??? ??? (?? E ??? ?? ???? hidden_states ????? ??? ??; 100 = ?? ??? ??).
-                 probe ? ?? q ? ?? ?? ??? ????, ??? test ? q ?? ?? ?? ??
-                 (summary.json ? by_pct, summary.png ? q ? AUC ??). --offset ? --pct ? ?? ? ??.
-                 ?? E ? ?? spectral.py --with-hidden ???? ??? --source pct --input hidden ? ??.
-    spectral [2] latent/spectral ???? ?? ??? e_t (e[t][-1], ???? kd ?? ??).
-                 n_back ? 1 ??? --all ? ??? ???? ?? ??? ??. --with-prompt/--offset ? ????.
-                 ? latent/spectral_states ?? (e[t] ? (kd,) ??, seg/pos ??) ? ??? ???.
-    edges    [3-5] ?? ???? ?? ? ??? ?? e_i (inference/spectral.py --n-front 5 --n-back 5).
-                 ??? ?? ???? ???? e_i ????? ????. --all ? ??? ??? --part both ? ??.
-                 --part both  [3] "Step N" ?? ??? ? ? 5? + ??? 5?
-                 --part front [4] ??? ? ? 5?
-                 --part back  [5] ??? 5? (? ? ?? = [2] ? e_t)
-                 ??? ??? ?? ? ?? ??("<START>" ?)? ???? ??.
-                 ?? ?? + ? 5 + ? 5 ?? ?? ??? 3/4/5 ???? ?? (--keep-short ? ?).
-                 --k / --sign-mode ? spectral ??? ???.
-    pct      [6] ?? ??? ? --pct ? ??? ?? (inference/spectral.py --pct 10 20 ? 100) ??
-                 ?? ??? Q% ???? ??? e ?? (--pct Q ? ??? ???, ???? ?? ??).
-                 ??? spectral.pct_position ?? ????. 100 ? [2] ? e_t ? ??.
-                 t < k ? ??(?? ??? ?? Q) ? ??? ?? ???; ??? stats ? t_lt_k ? ??.
-                 --min-len L ? ?? ?? L ?? ??? ?? (?? ???? ?? Q ? ?? ??? ???? ?? ?? ?).
-    --input hidden|spectral  (edges / pct) ???? ?? ??? ??. spectral(??) = ?? gram e (kd ??),
-                 hidden = ?? ??? hidden state ? h (d ??; spectral.py --with-hidden ?? ??? _h ?? ???).
-                 ?? pos ?? e ? h ? ??? ??? "??? vs gram" ??? ?? ?? ?? ??? ??.
-    ??: acc / f1 / auc ? ?? margin = ? ??? ??? ?? (acc ? 1.0 ? ??? ??? ???? ??? ??).
-    --max-step M ? step M ??? probe ??. --drop-above-max ? ?? ?? ? ? step ?
-    ?? ????? ???.
-    ??? ?? ???? ???? ??? ?? ????? ??? train/test ? ??? ???.
-    --n-episodes N ? ?? ?? ? ???? N ?? ??? (success ??, ???? failure ? ??,
-    --sample-seed ? ??). ?? ???? ??? <output>/episodes.json ? ??.
+입력 종류 (--source). 라벨은 모두 같다: 해당 구간이면 참, 다른 구간이면 거짓.
+    hidden   [1] hidden_states 의 구간 마지막 토큰 (위 설명)
+    spectral [2] latent/spectral 저장본의 구간 마지막 e_t (e[t][-1], 구간마다 kd 벡터 하나).
+                 n_back ≥ 1 이거나 --all 로 저장한 파일이면 어느 것이든 된다. --with-prompt/--offset 은 무시된다.
+    edges    [3-5] 같은 저장본의 구간 안 토큰별 누적 e_i (inference/spectral.py --n-front 5 --n-back 5).
+                 누적은 구간 시작에서 리셋되고 e_i 하나하나가 샘플이다. --all 로 저장한 파일은 --part both 만 된다.
+                 --part both  [3] "Step N" 헤더 토큰을 뺀 앞 5개 + 마지막 5개
+                 --part front [4] 헤더를 뺀 앞 5개
+                 --part back  [5] 마지막 5개 (맨 끝 하나 = [2] 의 e_t)
+                 터미널 구간은 정답 앞 형식 문구("<START>" 등)를 헤더처럼 뺀다.
+                 형식 문구 + 앞 5 + 뒤 5 보다 짧은 구간은 3/4/5 모두에서 뺀다 (--keep-short 로 끔).
+                 --k / --sign-mode 로 spectral 설정을 고른다.
+    --max-step M 은 step M 까지만 probe 한다. --drop-above-max 를 같이 주면 그 뒤 step 은
+    음성 샘플에서도 빠진다.
+    분할은 어느 입력이든 에피소드 단위라 같은 에피소드의 샘플이 train/test 에 섞이지 않는다.
 
 Usage:
     python probing.py --pt 'latent/hidden_states/plan/*/*/chunk_*.pt' --output out/plan_all
@@ -64,16 +47,7 @@ Usage:
         --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_f5_b5/chunk_*.pt' --output out/edge_front
     python probing.py --pt 'latent/hidden_states/plan/BabyAI-GoTo-v0/*/chunk_*.pt' \
         --output out/plan_goto --offset 1 --cv
-    python probing.py --source pct --pct 40 \
-        --pt 'latent/spectral/*/*/*/k8_scaled_sign-data_p10-20-40-60-80-90-100/chunk_*.pt' --output out/pct_40
-    python probing.py --pt 'latent/hidden_states_marker/decompose/BabyAI-GoToObj-v0/*/chunk_*.pt' \
-        --pct 10 20 40 60 80 90 100 --output out/hidden_pct_gotoobj   # ?? E ?? ??, q ? ??
-    python probing.py --source pct --pct 5 --input hidden --min-len 20 \
-        --pt 'latent/spectral/decompose/BabyAI-GoToObj-v0/*/k8_scaled_sign-data_p1-5-10-20-50-80-90-95-99-100_h/chunk_*.pt' \
-        --output out/pct_h_05                       # ?? ????? --input spectral ? ??? gram ?
-    (?? % ? ? ?? ?? ????: script/pct_curve.py)
 """
-import sys
 import json
 import glob
 import pickle
@@ -90,17 +64,13 @@ from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "inference"))
-from spectral import pct_position  # noqa: E402  (?? ?? ?? q% ? ?? ??)
-
-PROMPT_LABEL = 0          # step_num 0 = ???? ?
-ANSWER_LABEL = -1         # step_num -1 = ???(?? ??)
+PROMPT_LABEL = 0          # step_num 0 = 프롬프트 끝
+ANSWER_LABEL = -1         # step_num -1 = 터미널(정답 문장)
 
 
-# ---------------------------------------------------------------- .pt ??
+# ---------------------------------------------------------------- .pt 로딩
 
-SOURCES = ("hidden", "spectral", "edges", "pct")
+SOURCES = ("hidden", "spectral", "edges")
 
 
 def _paths(patterns):
@@ -118,24 +88,21 @@ def _gid(p: Path, source: str, seed) -> str:
     return f"{task}/{level}/{status}/{seed}"
 
 
-def load_pt(patterns, offset, with_prompt=False, pct=None):
-    """[1] hidden_states: ?? ??? ?? E[end-1-offset] ??.
-    pct ? ?? ???? q% ?? ??? q ?? ??? (offset ? 0 ??? ??). ??? q ? Ps ? ???."""
-    Xs, Ns, Gs, Ps = [], [], [], []
+def load_pt(patterns, offset, with_prompt=False):
+    """[1] hidden_states: 구간 마지막 토큰 E[end-1-offset] 하나."""
+    Xs, Ns, Gs = [], [], []
     stats = Counter()
-    if pct and offset:
-        raise SystemExit("--pct ? --offset ? ?? ? ??")
 
     for p in _paths(patterns):
         d = torch.load(p, map_location="cpu", weights_only=False)
 
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "hidden", seed)
-            E = ep["E"]                                   # bf16 torch ??? (GPU ??? ??? ???)
+            E = ep["E"].float().numpy()
             b = [int(x) for x in ep["boundaries"]]
             n_tok = E.shape[0]
 
-            # ??: [0, prompt, step1..stepN, terminal ?] ? ?? ?? 4 (step 1?)
+            # 규약: [0, prompt, step1..stepN, terminal 끝] → 최소 길이 4 (step 1개)
             if len(b) < 4 or b[0] != 0 or b[-1] != n_tok:
                 stats["bad_boundaries"] += 1
                 continue
@@ -145,47 +112,41 @@ def load_pt(patterns, offset, with_prompt=False, pct=None):
             stats["episodes"] += 1
 
             def take(start, end, label):
-                if pct:                                       # q% ?? ???, q ?? ? ?
-                    for q in pct:
-                        i = start + pct_position(q, end - start)
-                        Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(q)
-                    return
                 i = end - 1 - offset
                 if i < start:
                     stats["segment_too_short"] += 1
                     return
-                Xs.append(E[i].clone()); Ns.append(label); Gs.append(gid); Ps.append(100)  # view ? E ??? ???? 300GB ?? ?
+                Xs.append(E[i].copy()); Ns.append(label); Gs.append(gid)   # view 면 E 전체가 살아남아 300GB 까지 감
 
-            if with_prompt:                                   # ????? ?? ??? ?? ??
-                i = b[1] - 1 - offset
-                Xs.append(E[i].clone()); Ns.append(PROMPT_LABEL); Gs.append(gid); Ps.append(100)
+            if with_prompt:
+                take(b[0], b[1], PROMPT_LABEL)
             for k, (s, e) in enumerate(zip(b[1:-2], b[2:-1]), start=1):   # step 1..N
                 take(s, e, k)
-            take(b[-2], b[-1], ANSWER_LABEL)                              # ???
+            take(b[-2], b[-1], ANSWER_LABEL)                              # 터미널
 
-    return _pack(Xs, Ns, Gs, stats, Ps)
+    return _pack(Xs, Ns, Gs, stats)
 
 
 def _seg_label(t: int, n_seg: int) -> int:
-    """gen_view ?? ?? t (0..N-1 = step 1..N, N = ???) ? step_num."""
+    """gen_view 구간 번호 t (0..N-1 = step 1..N, N = 터미널) → step_num."""
     return ANSWER_LABEL if t == n_seg - 1 else t + 1
 
 
 def _config_ok(d, p, k, sign_mode, seen, stats):
-    """??? k / sign_mode ? ??? ???. ?? ?? ??? ??? ??? ?? ???."""
+    """헤더의 k / sign_mode 로 파일을 거른다. 서로 다른 설정이 섞이면 차원이 달라 멈춘다."""
     cfg = (d.get("k"), d.get("sign_mode"), d.get("scale"))
     if (k is not None and cfg[0] != k) or (sign_mode is not None and cfg[1] != sign_mode):
         stats["file_config_skipped"] += 1
         return False
     seen.add(cfg)
     if len(seen) > 1:
-        raise SystemExit(f"?? ?? spectral ??? ??? {sorted(seen, key=str)} ? "
-                         f"--k / --sign-mode ? ??? ???? glob ? ?? ? ({p})")
+        raise SystemExit(f"서로 다른 spectral 설정이 섞였다 {sorted(seen, key=str)} — "
+                         f"--k / --sign-mode 로 하나만 고르거나 glob 을 좁힐 것 ({p})")
     return True
 
 
 def load_spectral(patterns, k=None, sign_mode=None):
-    """[2] spectral: ?? ??? ??? e_t = e[t][-1] (???? ??, ??? ??? ??? ???)."""
+    """[2] spectral: 구간 전체를 누적한 e_t = e[t][-1] (구간마다 하나, 마지막 위치가 저장된 구간만)."""
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
     for p in _paths(patterns):
@@ -194,40 +155,27 @@ def load_spectral(patterns, k=None, sign_mode=None):
             continue
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "spectral", seed)
-            seg, n_seg = ep.get("seg"), len(ep["e"])
+            seg, n_seg = ep["seg"], len(ep["e"])
             stats["episodes"] += 1
             for t in sorted(ep["e"]):
-                row = ep["e"][t]
-                if row.dim() == 1:                                    # ? spectral_states: ???? e_t ??
-                    Xs.append(row.clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
-                    continue
                 ps = ep["pos"][t]
-                if not ps or ps[-1] != seg[t + 1] - seg[t] - 1:      # ??? ??? ??? ??? e_t
+                if not ps or ps[-1] != seg[t + 1] - seg[t] - 1:      # 마지막 토큰이 저장돼 있어야 e_t
                     stats["no_last_token"] += 1
                     continue
-                Xs.append(row[-1].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                Xs.append(ep["e"][t][-1].float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
-def _vec_key(d, p, inp):
-    """????? ?? ?. hidden ?? --with-hidden ?? ??? ????? ??."""
-    if inp == "hidden":
-        if not d.get("hidden"):
-            raise SystemExit(f"{p}: hidden ?? ??? ?? ?? (spectral.py --with-hidden ?? ?? _h ?? ?? ??)")
-        return "h"
-    return "e"
+def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False):
+    """[3-5] edges: 구간 안 토큰별 누적 e_i 중 앞(형식 문구 제외)/뒤 가장자리.
 
+    part: both (3) | front (4) | back (5). e_i 하나하나가 샘플이고 라벨은 그 구간.
+    저장본은 위치 pos 와 e 만 갖고 있으므로 front/back 은 헤더의 n_front/n_back 과 marker 로 가른다:
+    front = marker ≤ p < marker+n_front, back = p ≥ n-n_back. --all 저장본은 part both 만 된다.
 
-def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False, inp="spectral"):
-    """[3-5] edges: ?? ? ??? ?? e_i ? ?(?? ?? ??)/? ????.
-
-    part: both (3) | front (4) | back (5). e_i ????? ???? ??? ? ??.
-    ???? ?? pos ? e ? ?? ???? front/back ? ??? n_front/n_back ? marker ? ???:
-    front = marker ? p < marker+n_front, back = p ? n-n_back. --all ???? part both ? ??.
-
-    ?? ?? ??: ?? ?? < marker + n_front + n_back ?? (?/?? ???? ???)
-    ? ??? ??? ?? ? ????? ????? ? ??. part ? ???? ?? ????
-    3/4/5 ? ?? ?? ?? ??? ????. keep_short=True ? ?? (all ???? ?? ??).
+    짧은 구간 제외: 구간 길이 < marker + n_front + n_back 이면 (앞/뒤가 겹치거나 모자람)
+    그 구간은 통째로 뺀다 — 양성으로도 음성으로도 안 쓴다. part 와 상관없이 같은 기준이라
+    3/4/5 가 같은 구간 집합 위에서 비교된다. keep_short=True 면 끈다 (all 저장본은 해당 없음).
     """
     Xs, Ns, Gs = [], [], []
     stats, seen = Counter(), set()
@@ -237,8 +185,7 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False, inp="sp
             continue
         n_front, n_back, is_all = d["n_front"], d["n_back"], d.get("all", False)
         if is_all and part != "both":
-            raise SystemExit(f"--all ? ??? ??? --part both ? ?? ({p})")
-        key = _vec_key(d, p, inp)
+            raise SystemExit(f"--all 로 저장한 파일은 --part both 만 가능 ({p})")
         for seed, ep in d["episodes"].items():
             gid = _gid(p, "edges", seed)
             n_seg = len(ep["e"])
@@ -251,77 +198,28 @@ def load_edges(patterns, part, k=None, sign_mode=None, keep_short=False, inp="sp
                     stats[f"short_{target_name(_seg_label(t, n_seg))}"] += 1
                     if not keep_short:
                         continue
-                for pos, row in zip(ep["pos"][t], ep[key][t]):
+                for pos, row in zip(ep["pos"][t], ep["e"][t]):
                     if part == "front" and not (m <= pos < m + n_front):
                         continue
                     if part == "back" and pos < n - n_back:
                         continue
-                    Xs.append(row.clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
+                    Xs.append(row.float().numpy()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
     return _pack(Xs, Ns, Gs, stats)
 
 
-def load_pct(patterns, pct, k=None, sign_mode=None, inp="spectral", min_len=0):
-    """[6] pct: ?? ??? pct% ???? ??? e (?? ?? ??? hidden ? h; inp) ? ???? ??.
-    --pct ? ??? ??? ???.
-
-    ???? pos ? e/h ? ?? ???? pct_position(pct, n) ?? ??? ??? ? ?? ???.
-    ?? ???? ?? % ? ?? ??? ???? ??? ??? ??. ??? ??? ??? ?
-    t < k ? ??(?? rank ??) ??? t_lt_k ? ??. min_len > 0 ?? ??? ?? ??? ??
-    (short_segment ? ??) ? ??·?? ?? ???? ? ??."""
-    Xs, Ns, Gs = [], [], []
-    stats, seen = Counter(), set()
-    for p in _paths(patterns):
-        d = torch.load(p, map_location="cpu", weights_only=False)
-        if not _config_ok(d, p, k, sign_mode, seen, stats):
-            continue
-        if pct not in d.get("pct", []):
-            raise SystemExit(f"{p}: {pct}% ??? ??? ?? ?? (??? pct={d.get('pct')})")
-        key = _vec_key(d, p, inp)
-        k_eig = d["k"]
-        for seed, ep in d["episodes"].items():
-            gid = _gid(p, "edges", seed)                      # spectral/edges ? ?? ?? ??
-            seg, n_seg = ep["seg"], len(ep["e"])
-            stats["episodes"] += 1
-            for t in range(n_seg):
-                n = seg[t + 1] - seg[t]
-                if n < min_len:
-                    stats["short_segment"] += 1
-                    continue
-                want = pct_position(pct, n)
-                ps = ep["pos"][t]
-                if want not in ps:
-                    stats["pos_missing"] += 1
-                    continue
-                if want + 1 < k_eig:
-                    stats["t_lt_k"] += 1
-                Xs.append(ep[key][t][ps.index(want)].clone()); Ns.append(_seg_label(t, n_seg)); Gs.append(gid)
-    return _pack(Xs, Ns, Gs, stats, pct_value=pct)
-
-
-def _pack(Xs, Ns, Gs, stats, Ps=None, pct_value=100):
-    """? ?? ? data. X ? torch ???, ?? dtype ??? ?? (bf16 ????? bf16 ? fp32 ? ???
-    edges ? ?? GB ? ? ?? ??). CPU(sklearn) ??? main ?? ? ? float32 numpy ? ???.
-    pct: ??? "??? ? % ????" (Ps ? ??? ?? pct_value). ?? % ? ?? ?? ? q ? ??? ??."""
+def _pack(Xs, Ns, Gs, stats):
     if not Xs:
-        raise SystemExit("?? ?? ? ?? ??/?? ??")
-    X = torch.stack(Xs)
-    Xs.clear()
-    P = np.array(Ps if Ps is not None else [pct_value] * len(Ns), np.int32)
-    data = dict(X=X, step_num=np.array(Ns, np.int32), group=np.array(Gs, dtype=object), pct=P)
+        raise SystemExit("벡터 없음 — 입력 경로/규약 확인")
+    data = dict(X=np.stack(Xs).astype(np.float32),
+                step_num=np.array(Ns, np.int32),
+                group=np.array(Gs, dtype=object))
     print(f"loaded: {dict(stats)}")
-    print(f"  X={tuple(X.shape)} {str(X.dtype).removeprefix('torch.')}  "
-          f"??? ??={dict(sorted(Counter(Ns).items()))}  groups={len(set(Gs))}"
-          + (f"  pct? ??={dict(sorted(Counter(P.tolist()).items()))}" if len(set(P.tolist())) > 1 else ""))
+    print(f"  X={data['X'].shape}  구간별 개수={dict(sorted(Counter(Ns).items()))}  "
+          f"groups={len(set(Gs))}")
     return data
 
 
-def _take(data, idx):
-    """? ???? data ? ??? (X ? torch, ???? numpy)."""
-    idx = np.asarray(idx)
-    return {k: (v[torch.as_tensor(idx)] if torch.is_tensor(v) else v[idx]) for k, v in data.items()}
-
-
-# ---------------------------------------------------------------- ???? / ??
+# ---------------------------------------------------------------- 데이터셋 / 모델
 
 def target_name(label: int) -> str:
     if label == PROMPT_LABEL:
@@ -331,352 +229,169 @@ def target_name(label: int) -> str:
     return f"step_{label}"
 
 
-def subsample_episodes(data, n, seed):
-    """????(group) ??? n ?? ???. success ? ?? ??? ???? failure ?.
-
-    group id ? "<task>/<level>/<status>/<seed>" ? status ? ??? ???. success ? n ??
-    ??? ? ??? n ?? ???? ???. ??: (?? data, ?? group ?? ??)."""
-    groups = np.unique(data["group"])
-    status = np.array([g.split("/")[2] for g in groups])
-    rng = np.random.default_rng(seed)
-    succ = rng.permutation(groups[status == "success"])
-    fail = rng.permutation(groups[status != "success"])
-    keep = np.concatenate([succ[:n], fail[:max(0, n - len(succ))]])
-    mask = np.isin(data["group"], keep)
-    print(f"--n-episodes {n}: success {min(n, len(succ))}/{len(succ)} + failure "
-          f"{max(0, n - len(succ))}/{len(fail)} ? {len(keep)} episodes, X={int(mask.sum())} rows")
-    if not mask.all():
-        data = _take(data, np.flatnonzero(mask))
-    return data, sorted(keep.tolist())
-
-
 def make_binary(data, label):
-    """one-vs-rest ??: ?? ??? 1, ??? ?? ?? 0. X ? ???? ??? (edges ? ?? GB)."""
-    y = (data["step_num"] == label).astype(int)
-    return data["X"], y, data["group"]
+    """one-vs-rest: 해당 구간이 positive, 나머지 구간 전부가 negative."""
+    m = data["step_num"] == label
+    X = np.vstack([data["X"][m], data["X"][~m]])
+    y = np.r_[np.ones(m.sum()), np.zeros((~m).sum())].astype(int)
+    g = np.concatenate([data["group"][m], data["group"][~m]])
+    return X, y, g
 
 
-def split(n, y, g, test_size, seed, group):
-    """? ??? (train, test). group=True ? ???? ??."""
-    dummy = np.empty((n, 0))
+def split(X, y, g, test_size, seed, group):
     if group:
-        return next(GroupShuffleSplit(1, test_size=test_size, random_state=seed).split(dummy, y, g))
-    return train_test_split(np.arange(n), test_size=test_size, random_state=seed, stratify=y)
+        return next(GroupShuffleSplit(1, test_size=test_size,
+                                      random_state=seed).split(X, y, g))
+    return train_test_split(np.arange(len(y)), test_size=test_size,
+                            random_state=seed, stratify=y)
 
 
-class GpuData:
-    """X ??? GPU ? ? ?? ?? ?? (?? dtype ??? ? bf16 ?? fp32 ? ??), fit / predict ?
-    ? ???? ??? ?? fp32 ? ?? ??. 70? x 40960 bf16 ? 57GB ? GPU ? ????."""
-
-    def __init__(self, X: torch.Tensor, device, chunk: int = 32768):
-        self.device = torch.device(device)
-        self.X = X.to(self.device)
-        self.chunk = chunk
-
-    def batches(self, idx):
-        """idx ???? (m x D) fp32 ??? ??."""
-        idx_t = torch.as_tensor(np.asarray(idx), device=self.device)
-        for i in range(0, len(idx_t), self.chunk):
-            yield self.X[idx_t[i:i + self.chunk]].float()
-
-
-class TorchLogReg:
-    """GPU ???? ??. sklearn LogisticRegression(C, L2, class_weight="balanced") ? ?? ????
-
-        C · ?_i w_i · logloss_i(?)  +  ½??_w?²      (w_i = n / (2·n_class(i)), ??? ?? ??)
-
-    ? torch L-BFGS(strong Wolfe) ? ??. ??? ???? GpuData ??? ?? ????? ?????
-    autograd ????, X ? fp32 ???? ??? ???. scale=True ? StandardScaler ? ?? ???
-    (?? ? ?? ??/????, 2-pass) ? ????. ?? ? ????? CPU ? ?? pickle ??."""
-
-    def __init__(self, C=1.0, scale=True, max_iter=500, tol=1e-5):
-        self.C, self.scale, self.max_iter, self.tol = C, scale, max_iter, tol
-
-    def fit(self, gd: GpuData, idx, y):
-        dev, d = gd.device, gd.X.shape[1]
-        n, n_pos = len(idx), float(np.sum(y))
-        y_t = torch.as_tensor(np.asarray(y), dtype=torch.float32, device=dev)
-        w_t = torch.where(y_t > 0.5, torch.tensor(n / (2 * n_pos), device=dev),
-                          torch.tensor(n / (2 * (n - n_pos)), device=dev))        # balanced
-
-        if self.scale:                                                           # 2-pass ??/????
-            mean = torch.zeros(d, device=dev)
-            for xb in gd.batches(idx):
-                mean += xb.sum(0)
-            mean /= n
-            var = torch.zeros(d, device=dev)
-            for xb in gd.batches(idx):
-                xb -= mean
-                var += (xb * xb).sum(0)
-            std = (var / n).sqrt()
-            std = torch.where(std > 0, std, torch.ones_like(std))
-        else:
-            mean, std = torch.zeros(d, device=dev), torch.ones(d, device=dev)
-
-        beta = torch.zeros(d + 1, device=dev, requires_grad=True)
-        bce = torch.nn.functional.binary_cross_entropy_with_logits
-
-        def closure():
-            with torch.no_grad():
-                wv, b = beta[:-1], beta[-1]
-                loss = torch.zeros((), device=dev)
-                grad = torch.zeros(d + 1, device=dev)
-                off = 0
-                for xb in gd.batches(idx):
-                    m = xb.shape[0]
-                    yb, wb = y_t[off:off + m], w_t[off:off + m]
-                    off += m
-                    xb = (xb - mean) / std
-                    z = xb @ wv + b
-                    loss += self.C * (wb * bce(z, yb, reduction="none")).sum()
-                    r = self.C * wb * (torch.sigmoid(z) - yb)
-                    grad[:-1] += xb.T @ r
-                    grad[-1] += r.sum()
-                loss += 0.5 * (wv * wv).sum()
-                grad[:-1] += wv
-            beta.grad = grad
-            return loss
-
-        opt = torch.optim.LBFGS([beta], lr=1.0, max_iter=self.max_iter, history_size=20,
-                                tolerance_grad=self.tol, tolerance_change=1e-9,
-                                line_search_fn="strong_wolfe")
-        opt.step(closure)
-        self.n_iter_ = opt.state[opt._params[0]].get("n_iter", -1)
-        self.mean_, self.std_, self.beta_ = mean.cpu(), std.cpu(), beta.detach().cpu()
-        return self
-
-    @torch.no_grad()
-    def predict_proba(self, gd: GpuData, idx):
-        dev = gd.device
-        mean, std, beta = self.mean_.to(dev), self.std_.to(dev), self.beta_.to(dev)
-        out = [torch.sigmoid(((xb - mean) / std) @ beta[:-1] + beta[-1]).cpu() for xb in gd.batches(idx)]
-        p = torch.cat(out).double().numpy()
-        return np.stack([1 - p, p], 1)
-
-
-def fit(Xnp, gd, y, idx, seed, cv, scale):
-    """Xnp: CPU ??? float32 numpy (GPU ??? None). gd: GpuData (CPU ??? None)."""
-    if gd is not None:
-        if cv:
-            raise SystemExit("--cv ? --device cpu ??? ??")
-        return TorchLogReg(C=1.0, scale=scale).fit(gd, idx, y[idx])
+def fit(Xtr, ytr, seed, cv, scale):
     if cv:
         lr = LogisticRegressionCV(Cs=np.logspace(-4, 2, 7), cv=5, scoring="roc_auc",
                                   class_weight="balanced", max_iter=2000,
                                   random_state=seed, n_jobs=-1)
     else:
         lr = LogisticRegression(class_weight="balanced", max_iter=2000, random_state=seed)
-    return (make_pipeline(StandardScaler(), lr) if scale else make_pipeline(lr)).fit(Xnp[idx], y[idx])
+    return (make_pipeline(StandardScaler(), lr) if scale else make_pipeline(lr)).fit(Xtr, ytr)
 
 
-def evaluate(clf, Xnp, gd, idx, y):
-    """acc / f1 / auc + margin. margin = ? ???? ? ??? ?? (y=1 ?? p, y=0 ?? 1-p):
-    0.5 = ??, 1.0 = ?? ??. acc ? ???? ??? ?? ???? ??? ???."""
-    p = clf.predict_proba(gd, idx)[:, 1] if gd is not None else clf.predict_proba(Xnp[idx])[:, 1]
+def evaluate(clf, X, y):
+    p = clf.predict_proba(X)[:, 1]
     yhat = (p > 0.5).astype(int)
     return dict(acc=accuracy_score(y, yhat), f1=f1_score(y, yhat, zero_division=0),
-                auc=roc_auc_score(y, p), margin=float(np.mean(np.where(y == 1, p, 1 - p))))
+                auc=roc_auc_score(y, p))
 
 
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pt", nargs="+", required=True, help="chunk_*.pt glob (?? ? ??)")
+    ap.add_argument("--pt", nargs="+", required=True, help="chunk_*.pt glob (여러 개 가능)")
     ap.add_argument("--source", choices=SOURCES, default="hidden",
-                    help="hidden: ?? ??? ?? hidden (1) | spectral: ?? ?? ?? e_t (2) | "
-                         "edges: ?? ?/? ??? ?? e_i (3-5, --part) | pct: ?? Q%% ?? ?? e (6, --pct)")
-    ap.add_argument("--pct", type=int, nargs="+", default=None, metavar="Q",
-                    help="hidden: ?? ??? Q%% ?? ??? (?? ?; ??? ???? ??? Q ?) | "
-                         "pct ??: ???? --pct ?? ? ?? (100 = ?? ?)")
+                    help="hidden: 구간 마지막 토큰 hidden (1) | spectral: 구간 전체 누적 e_t (2) | "
+                         "edges: 구간 앞/뒤 토큰별 누적 e_i (3-5, --part)")
     ap.add_argument("--part", choices=("both", "front", "back"), default="both",
-                    help="--source edges ? ?: both=?5+?5 (3), front=?? ? ?5 (4), back=?5 (5)")
+                    help="--source edges 일 때: both=앞5+뒤5 (3), front=헤더 뺀 앞5 (4), back=뒤5 (5)")
     ap.add_argument("--k", type=int, default=None,
-                    help="spectral/edges: ? k ? ??? ?? (??: glob ? ?? ???)")
+                    help="spectral/edges: 이 k 인 파일만 쓴다 (기본: glob 이 잡은 그대로)")
     ap.add_argument("--sign-mode", default=None, choices=("none", "first", "max", "data"),
-                    help="spectral/edges: ? ?? ??? ??? ??")
+                    help="spectral/edges: 이 부호 규칙인 파일만 쓴다")
     ap.add_argument("--keep-short", action="store_true",
-                    help="edges: marker+?+? ?? ?? ??? ??? (??? ??)")
-    ap.add_argument("--input", choices=("spectral", "hidden"), default="spectral",
-                    help="edges/pct ????? ?? gram e(spectral) ? ??, ?? ??? hidden ? h ? ?? "
-                         "(h ? spectral.py --with-hidden ?? ??? _h ???? ??)")
-    ap.add_argument("--min-len", type=int, default=0,
-                    help="pct: ? ??(??) ?? ??? ???? ?? (?? %% ? ? ??? ???? ?? ?? ??)")
+                    help="edges: marker+앞+뒤 보다 짧은 구간도 넣는다 (기본은 제외)")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--offset", type=int, default=0,
-                    help="?? ??? ???? ? ? ?? ??? ?? (ablation)")
+                    help="구간 마지막 토큰에서 몇 칸 앞을 대표로 쓸지 (ablation)")
     ap.add_argument("--with-prompt", action="store_true",
-                    help="???? ?? ??? ??? ???? ??")
+                    help="프롬프트 구간 마지막 토큰도 클래스로 포함")
     ap.add_argument("--max-step", type=int, default=None,
-                    help="? ??? ?? step ? probe ???? ?? (??: negative ?? ??)")
+                    help="이 번호를 넘는 step 은 probe 대상에서 제외 (기본: negative 로는 남음)")
     ap.add_argument("--drop-above-max", action="store_true",
-                    help="--max-step ? ?? step ??? ????? ?? ?? (negative ?? ? ?)")
-    ap.add_argument("--n-episodes", type=int, default=None,
-                    help="?? ? ???? ? ??? ?? (success ??, ???? failure ? ??)")
-    ap.add_argument("--sample-seed", type=int, default=0, help="--n-episodes ?? ??")
+                    help="--max-step 을 넘는 step 샘플을 데이터에서 아예 뺀다 (negative 로도 안 씀)")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 123, 456, 789, 1011])
     ap.add_argument("--test-size", type=float, default=0.2)
     ap.add_argument("--no-group-split", action="store_true",
-                    help="???? ?? ??? ?? (?? ????? train/test ? ???)")
+                    help="에피소드 단위 분할을 끈다 (같은 에피소드가 train/test 로 쪼개짐)")
     ap.add_argument("--no-scale", action="store_true")
     ap.add_argument("--cv", action="store_true")
-    ap.add_argument("--device", default="cpu",
-                    help="cpu: sklearn LogisticRegression | cuda[:i]: ?? ????? torch L-BFGS ? (TorchLogReg)")
     a = ap.parse_args()
 
     a.output.mkdir(parents=True, exist_ok=True)
     (a.output / "classifiers").mkdir(exist_ok=True)
 
     if a.source == "hidden":
-        pct = sorted(set(a.pct)) if a.pct else None
-        data = load_pt(a.pt, a.offset, a.with_prompt, pct)
+        data = load_pt(a.pt, a.offset, a.with_prompt)
     elif a.source == "spectral":
         data = load_spectral(a.pt, a.k, a.sign_mode)
-    elif a.source == "pct":
-        if a.pct is None or len(a.pct) != 1:
-            raise SystemExit("--source pct ? --pct Q ??? ????")
-        data = load_pct(a.pt, a.pct[0], a.k, a.sign_mode, a.input, a.min_len)
     else:
-        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short, a.input)
-    if a.n_episodes is not None:
-        data, kept = subsample_episodes(data, a.n_episodes, a.sample_seed)
-        with open(a.output / "episodes.json", "w") as f:
-            json.dump({"n_episodes": a.n_episodes, "sample_seed": a.sample_seed, "groups": kept}, f)
+        data = load_edges(a.pt, a.part, a.k, a.sign_mode, a.keep_short)
     if a.max_step is not None and a.drop_above_max:
-        keep = data["step_num"] <= a.max_step          # answer(-1)·prompt(0) ? ???
-        print(f"--drop-above-max: step>{a.max_step} ?? {int((~keep).sum())}? ??")
-        data = _take(data, np.flatnonzero(keep))
+        keep = data["step_num"] <= a.max_step          # answer(-1)·prompt(0) 는 남는다
+        print(f"--drop-above-max: step>{a.max_step} 샘플 {int((~keep).sum())}개 제거")
+        data = {k_: v[keep] for k_, v in data.items()}
     group, scale = not a.no_group_split, not a.no_scale
     if group and len(np.unique(data["group"])) < 2:
-        print("[warn] ??? 1?? ? ? ?? split ?? ??")
+        print("[warn] 그룹이 1개뿐 → 행 단위 split 으로 대체")
         group = False
 
     labels = sorted(np.unique(data["step_num"]).tolist())
     if a.max_step is not None:
         labels = [l for l in labels if l <= a.max_step]
-    # ?? ?? ??: prompt, step 1..N, answer
+    # 보기 좋은 순서: prompt, step 1..N, answer
     labels = ([PROMPT_LABEL] if PROMPT_LABEL in labels else []) \
              + [l for l in labels if l > 0] \
              + ([ANSWER_LABEL] if ANSWER_LABEL in labels else [])
 
-    pcts = sorted(set(data["pct"].tolist()))                 # ???? ?? % ?? (????? q ? ?? ??)
-    if len(pcts) == 1:
-        pcts = []
     print(f"targets={[target_name(l) for l in labels]} "
-          f"source={a.source} input={a.input} part={a.part} pct={a.pct} eval_pcts={pcts or '-'} "
-          f"min_len={a.min_len} group={group} scale={scale} cv={a.cv} "
-          f"offset={a.offset} device={a.device}")
-
-    if a.device == "cpu":
-        Xnp, gd = data["X"].float().numpy(), None            # float32 ????? ?? ??
-    else:
-        Xnp, gd = None, GpuData(data["X"], a.device)
-        print(f"X on {a.device}: {tuple(gd.X.shape)} {str(gd.X.dtype).removeprefix('torch.')} "
-              f"({gd.X.numel() * gd.X.element_size() / 2**30:.1f} GiB)")
+          f"source={a.source} part={a.part} group={group} scale={scale} cv={a.cv} offset={a.offset}")
 
     rows = []
     for label in labels:
         t = target_name(label)
         X, y, g = make_binary(data, label)
         if y.sum() < 2 or (1 - y).sum() < 2:
-            print(f"[skip] {t}: ?? ??")
+            print(f"[skip] {t}: 샘플 부족")
             continue
         for s in a.seeds:
-            tr, te = split(len(y), y, g, a.test_size, s, group)
+            tr, te = split(X, y, g, a.test_size, s, group)
             if len(np.unique(y[te])) < 2:
-                print(f"[skip] {t} seed={s}: test ? ? ????")
+                print(f"[skip] {t} seed={s}: test 에 한 클래스만")
                 continue
-            clf = fit(Xnp, gd, y, tr, s, a.cv, scale)
-            m_tr, m_te = evaluate(clf, Xnp, gd, tr, y[tr]), evaluate(clf, Xnp, gd, te, y[te])
-            lr = clf if isinstance(clf, TorchLogReg) else clf[-1]
-            C = float(np.atleast_1d(getattr(lr, "C_", lr.C))[0])
-            rows.append(dict(target=t, seed=s, eval_pct="all", n_train=int(len(tr)), n_test=int(len(te)),
-                             n_pos_test=int(y[te].sum()), C=C,
+            clf = fit(X[tr], y[tr], s, a.cv, scale)
+            m_tr, m_te = evaluate(clf, X[tr], y[tr]), evaluate(clf, X[te], y[te])
+            lr = clf[-1]
+            rows.append(dict(target=t, seed=s, n_train=int(len(tr)), n_test=int(len(te)),
+                             n_pos_test=int(y[te].sum()),
+                             C=float(np.atleast_1d(getattr(lr, "C_", lr.C))[0]),
                              **{f"train_{k}": float(v) for k, v in m_tr.items()},
                              **{f"test_{k}": float(v) for k, v in m_te.items()}))
-            per_pct = ""
-            for q in pcts:                                   # ?? probe ? test ? q% ???? ??
-                te_q = te[data["pct"][te] == q]
-                if len(te_q) == 0 or len(np.unique(y[te_q])) < 2:
-                    continue
-                m_q = evaluate(clf, Xnp, gd, te_q, y[te_q])
-                rows.append(dict(target=t, seed=s, eval_pct=int(q), n_train=int(len(tr)), n_test=int(len(te_q)),
-                                 n_pos_test=int(y[te_q].sum()), C=C,
-                                 **{f"test_{k}": float(v) for k, v in m_q.items()}))
-                per_pct += f" {q}%={m_q['auc']:.3f}"
             with open(a.output / "classifiers" / f"{t}_seed{s}.pkl", "wb") as f:
                 pickle.dump(clf, f)
             print(f"{t:8s} seed={s:5d}  AUC={m_te['auc']:.3f} "
-                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f} margin={m_te['margin']:.3f}"
-                  + (f"  | AUC by pct:{per_pct}" if per_pct else ""))
+                  f"Acc={m_te['acc']:.3f} F1={m_te['f1']:.3f}")
 
     if not rows:
-        raise SystemExit("??? probe ? ??")
+        raise SystemExit("학습된 probe 가 없다")
 
     with open(a.output / "results_all.json", "w") as f:
         json.dump(rows, f, indent=2)
 
-    def agg(r):
-        return {k: dict(mean=float(np.mean([x[k] for x in r])), std=float(np.std([x[k] for x in r])))
-                for k in ("test_auc", "test_acc", "test_f1", "test_margin")}
-
     summary = {}
     for label in labels:
         t = target_name(label)
-        r = [x for x in rows if x["target"] == t and x["eval_pct"] == "all"]
-        if not r:
-            continue
-        summary[t] = agg(r)
-        summary[t]["n_seeds"] = len(r)
-        if pcts:
-            summary[t]["by_pct"] = {str(q): agg(rq) for q in pcts
-                                    if (rq := [x for x in rows if x["target"] == t and x["eval_pct"] == q])}
+        r = [x for x in rows if x["target"] == t]
+        if r:
+            summary[t] = {k: dict(mean=float(np.mean([x[k] for x in r])),
+                                  std=float(np.std([x[k] for x in r])))
+                          for k in ("test_auc", "test_acc", "test_f1")}
+            summary[t]["n_seeds"] = len(r)
     with open(a.output / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print("\n" + "-" * 62)
-    print(f"{'target':8s} {'AUC':>15s} {'Acc':>15s} {'F1':>15s} {'margin':>15s}")
+    print(f"{'target':8s} {'AUC':>15s} {'Acc':>15s} {'F1':>15s}")
     for t, s in summary.items():
         fmt = lambda k: f"{s[k]['mean']:.3f} ± {s[k]['std']:.3f}"
-        print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s} "
-              f"{fmt('test_margin'):>15s}")
-    if pcts:
-        for met, lab in (("test_auc", "AUC"), ("test_margin", "margin")):
-            print(f"\n{lab} by eval pct (??? ?? %, ??? ? % ??)")
-            print(f"{'target':8s}" + "".join(f"{q:>9d}%" for q in pcts))
-            for t, s in summary.items():
-                print(f"{t:8s}" + "".join(f"{s['by_pct'][str(q)][met]['mean']:10.3f}"
-                                           if str(q) in s.get("by_pct", {}) else f"{'-':>10s}" for q in pcts))
+        print(f"{t:8s} {fmt('test_auc'):>15s} {fmt('test_acc'):>15s} {fmt('test_f1'):>15s}")
 
     ts = list(summary)
+    x, w = np.arange(len(ts)), 0.25
     fig, ax = plt.subplots(figsize=(9, 5))
-    if pcts:                                                  # q ? AUC ??, ???? ? ??
-        for t in ts:
-            bp = summary[t].get("by_pct", {})
-            qs = [q for q in pcts if str(q) in bp]
-            ax.errorbar(qs, [bp[str(q)]["test_auc"]["mean"] for q in qs],
-                        yerr=[bp[str(q)]["test_auc"]["std"] for q in qs], marker="o", capsize=3, label=t)
-        ax.set_xlabel("eval position in segment (%)")
-        ax.set_ylabel("test AUC")
-        ax.set_xticks(pcts)
-    else:
-        x, w = np.arange(len(ts)), 0.25
-        for i, (k, lab) in enumerate([("test_auc", "AUC"), ("test_acc", "Acc"), ("test_f1", "F1")]):
-            ax.bar(x + (i - 1) * w, [summary[t][k]["mean"] for t in ts], w,
-                   yerr=[summary[t][k]["std"] for t in ts], capsize=3, label=lab)
-        ax.set_xticks(x)
-        ax.set_xticklabels(ts)
+    for i, (k, lab) in enumerate([("test_auc", "AUC"), ("test_acc", "Acc"), ("test_f1", "F1")]):
+        ax.bar(x + (i - 1) * w, [summary[t][k]["mean"] for t in ts], w,
+               yerr=[summary[t][k]["std"] for t in ts], capsize=3, label=lab)
     ax.axhline(0.5, color="red", ls="--", lw=1, alpha=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(ts)
     ax.set_ylim(0, 1.05)
     ax.legend()
-    vec = "hidden h" if a.input == "hidden" else "spectral e"
-    src = {"hidden": f"hidden offset={a.offset}" + (f" pct={a.pct}" if a.pct else ""), "spectral": "spectral e_t",
-           "edges": f"{vec} edges ({a.part})", "pct": f"{vec} @ {a.pct}%"}[a.source]
+    src = {"hidden": f"hidden offset={a.offset}", "spectral": "spectral e_t",
+           "edges": f"spectral edges ({a.part})"}[a.source]
     ax.set_title(f"Last-layer probes: {src} (seeds={len(a.seeds)}, group={group})")
     fig.tight_layout()
     fig.savefig(a.output / "summary.png", dpi=150)
     plt.close(fig)
-    print(f"\nsaved ? {a.output}")
+    print(f"\nsaved → {a.output}")
 
 
 if __name__ == "__main__":
