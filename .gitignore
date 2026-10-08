@@ -1,0 +1,37 @@
+# secrets
+key.txt
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.pkl
+# data & artifacts
+data/
+latent/
+visual/step_similarity/
+visual/heatmap/
+logs/
+nohup_*.out
+*.jsonl
+*.pt
+*.npz
+*.csv
+*.png
+*.log
+*.tar.gz
+zip/
+wandb/
+
+# os
+.DS_Store
+.vscode/
+*.md
+*.out
+.claude/
+.gitignore
+
+third_party/*
+*.bak
