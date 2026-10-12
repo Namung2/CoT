@@ -28,10 +28,11 @@ wandb/
 # os
 .DS_Store
 .vscode/
-*.md
+
 *.out
 .claude/
 .gitignore
 
 third_party/*
 *.bak
+test/*
