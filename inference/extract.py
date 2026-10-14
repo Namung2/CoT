@@ -15,6 +15,8 @@
                "output_sha1": 원문 기준 sha1}
     boundaries 길이 = N+3. 첫 구간 = 프롬프트, 마지막 구간 = 정답 문장(터미널).
     스텝 구간에는 "Step N" 마커 토큰이 없다 (StepSegmenter.prepare 참고). 헤더 줄의 제목·본문은 남는다.
+    strip_title=True 면 헤더 줄 전체(마커 + 제목 "Identify the mission goal")를 지워 구간이 본문 첫 글자에서
+    시작한다. 헤더의 "step_headers" 가 "marker_stripped" / "line_stripped" 로 어느 쪽인지 남는다.
 """
 from __future__ import annotations
 
@@ -67,11 +69,11 @@ class Segmentation:
 @dataclass
 class Cleaned:
     # Step N" 마커를 벗긴 출력과 그 좌표계의 경계.    
-    text: str                   # "### Step N."만 빠진 출력 (헤더 줄의 제목·본문은 남는다). 모델에는 이것이 들어간다.
+    text: str                   # "### Step N."(strip_title 이면 헤더 줄 전체)이 빠진 출력. 모델에는 이것이 들어간다.
     bounds: list[int]           # text 기준 [0, step2 시작, ..., stepN 시작, 터미널 시작, len(text)]
                                 # 합치는 태스크(decompose)는 터미널이 마지막 step 헤더 줄에서 시작하고 step 구간은 N-1 개
     term_end: int               #text 기준 터미널 마커 매치 끝 (터미널 형식 토큰 수를 셀 때)
-    n_header_chars: int         #벗겨낸 문자 수 (meta 기록용)
+    n_header_chars: int         #벗겨낸 문자 수 (meta 기록용; strip_title 이면 제목·개행까지 포함)
 
 
 class StepSegmenter:
@@ -109,10 +111,12 @@ class StepSegmenter:
     END_PAT = re.compile(r"(?i)<+\s*end\s*>+")
 
     def __init__(self, task: str, max_steps: int = MAX_STEPS,
-                 expected_steps: int | None = None, merge_last: bool | None = None):
+                 expected_steps: int | None = None, merge_last: bool | None = None,
+                 strip_title: bool = False):
         if task not in self.TERMINAL_PAT:
             raise ValueError(f"no terminal marker defined for task {task!r}")
         self.task = task
+        self.strip_title = strip_title       # True: 헤더 줄 전체(마커 + 제목) 를 지운다
         self.term_pat = self.TERMINAL_PAT[task]
         self.max_steps = max_steps
         # None 이면 태스크 기본값 (EXPECTED_STEPS / MERGE_LAST_STEP)
@@ -167,14 +171,20 @@ class StepSegmenter:
         return Segmentation(heads, starts, term, marks[-1].end()), None
 
     def _marker_spans(self, text: str, seg: Segmentation) -> list[tuple[int, int]]:
-        """지울 "Step N" 마커 범위 [ls, le). 마커만 있던 줄은 개행 + 뒤따르는 빈 줄까지."""
+        """지울 "Step N" 마커 범위 [ls, le). 마커만 있던 줄은 개행 + 뒤따르는 빈 줄까지.
+
+        strip_title=True 면 헤더 줄 전체를 지운다 — 마커 뒤의 제목("**Identify the mission goal:**")과
+        줄 끝 개행, 뒤따르는 빈 줄까지 — 그래서 구간이 본문 첫 글자에서 시작한다. plan/decompose 는 헤더 줄에
+        제목만 있다 (본문이 같은 줄에 붙는 궤적 없음, 최대 127자). predict 처럼 본문이 헤더 줄에 붙는
+        태스크에서는 본문 첫 줄까지 같이 날아가므로 쓰지 말 것.
+        """
         spans = []
         for m in seg.heads:
             ls = m.start()                           # STEP_PAT 은 줄 머리(^)에서만 맞으므로 줄 시작과 같다
             le = self.AFTER_MARK.match(text, m.end()).end()
             nl = text.find("\n", le)
             line_end = nl + 1 if nl >= 0 else len(text)
-            if not text[le:line_end].strip():
+            if self.strip_title or not text[le:line_end].strip():
                 le = line_end
                 while le < len(text):
                     nl = text.find("\n", le)
@@ -206,6 +216,9 @@ class StepSegmenter:
         boundary_straddle 로 버려진다. 마커 뒤에 아무것도 없는 스텝은 길이 0 → "empty_segment".
 
         MERGE_LAST_STEP 태스크는 마지막 step 의 마커도 지우되 그 줄부터는 터미널 구간이다.
+
+        strip_title=True (_marker_spans 참고) 면 제목까지 지운다. 합쳐진 마지막 step(decompose Step 6) 의
+        제목도 지워지므로 터미널은 그 본문(있으면) 또는 <START> 줄에서 시작한다.
         """
         seg, reason = self._segment(text)
         if reason is not None:
@@ -327,9 +340,10 @@ class EpisodeExtractor:
     """에피소드 하나: skip 판정 → 라벨 → 경계 → 토크나이즈 → hidden state."""
 
     def __init__(self, task: str, encoder: Encoder | None = None,
-                 max_tokens: int = MAX_TOKENS, min_step_tokens: int = MIN_STEP_TOKENS):
+                 max_tokens: int = MAX_TOKENS, min_step_tokens: int = MIN_STEP_TOKENS,
+                 strip_title: bool = False):
         self.task = task
-        self.segmenter = StepSegmenter(task)
+        self.segmenter = StepSegmenter(task, strip_title=strip_title)
         self.encoder = encoder or Encoder()
         self.max_tokens = max_tokens
         self.min_step_tokens = min_step_tokens
@@ -389,14 +403,14 @@ class EpisodeExtractor:
             n_tokens_output=boundaries[-1] - boundaries[1],   # 마커 제외
             n_tokens_terminal=boundaries[-1] - boundaries[-2],
             n_steps=len(boundaries) - 3,         # 프롬프트·터미널 제외
-            n_header_chars=cleaned.n_header_chars,   # forward pass 에서 빠진 "Step N" 마커 문자 수
+            n_header_chars=cleaned.n_header_chars,   # forward pass 에서 빠진 헤더 문자 수 (마커, strip_title 이면 제목까지)
         )
 
         if any(a >= b for a, b in zip(boundaries, boundaries[1:])):
             return skip("empty_token_segment")   # 문자로는 갈렸는데 토큰으로 뭉개진 구간
         step_lens = [e - s for s, e in zip(boundaries[1:-2], boundaries[2:-1])]   # step 1..N (프롬프트·터미널 제외)
         if step_lens and min(step_lens) < self.min_step_tokens:
-            return skip("short_step")            # 마커를 뗀 뒤 제목 몇 토큰만 남은 step
+            return skip("short_step")            # 헤더를 뗀 뒤 몇 토큰만 남은 step
         if len(ids) > self.max_tokens:
             return skip("too_long")
 
@@ -468,9 +482,11 @@ def load_episodes(path: Path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def chunk_header() -> dict:
+def chunk_header(strip_title: bool = False) -> dict:
     return {"model": MODEL, "boundary_layout": "prompt|steps|terminal",
-            "step_headers": "marker_stripped",   # "Step N" 마커만 입력에서 뺐다, 제목·본문은 남음
+            # marker_stripped: "Step N" 마커만 입력에서 뺐다 (제목·본문은 남음)
+            # line_stripped:   헤더 줄 전체(마커 + 제목) 를 뺐다 — 구간이 본문에서 시작
+            "step_headers": "line_stripped" if strip_title else "marker_stripped",
             "label_priority": LABEL_PRIORITY,
             "expected_steps": EXPECTED_STEPS,    # 이 개수가 아닌 궤적은 skip
             "terminal_includes_last_step": sorted(MERGE_LAST_STEP),   # 마지막 step 을 터미널에 합친 태스크
@@ -485,6 +501,7 @@ def extract_run(
     mode: str = "no_thinking",
     chunk: int = 256,
     limit: int | None = None,
+    strip_title: bool = False,
 ) -> None:
     src = data_dir / f"{task}_{mode}.jsonl"
     all_episodes = load_episodes(src)
@@ -499,8 +516,9 @@ def extract_run(
         print(f"limit={limit} (of {len(all_episodes)} loaded)")
 
     run_dir = out_root / task / level
-    extractor = EpisodeExtractor(task)
-    writer = ChunkWriter(run_dir, chunk, chunk_header())
+    extractor = EpisodeExtractor(task, strip_title=strip_title)
+    writer = ChunkWriter(run_dir, chunk, chunk_header(strip_title))
+    print(f"step headers: {'line (marker + title) stripped' if strip_title else 'marker stripped'} → {run_dir}")
     reasons = Counter()
     n_saved = 0
 

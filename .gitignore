@@ -36,3 +36,4 @@ wandb/
 third_party/*
 *.bak
 test/*
+.idea/
